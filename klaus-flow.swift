@@ -85,6 +85,9 @@ private final class FlowPillController: NSWindowController {
     private let processingPulseKey = "pill.processingPulse"
     private let symbolPopKey = "pill.symbolPop"
     private var recordingLevel: CGFloat = 0.0
+    private var focusModeActive: Bool = false
+    private var lastAppliedState: PillState = .hidden
+    private static let claudeOrange = NSColor(calibratedRed: 217.0/255, green: 119.0/255, blue: 87.0/255, alpha: 1.0)
 
     override init(window: NSWindow?) {
         let panel = FloatingPanel(
@@ -374,6 +377,22 @@ private final class FlowPillController: NSWindowController {
             topHighlightLayer.opacity = 0.72
             bottomShadeLayer.opacity = 0.5
         }
+        lastAppliedState = state
+        applyFocusBorder()
+    }
+
+    private func applyFocusBorder() {
+        guard let blurLayer = blurView.layer else { return }
+        let active = focusModeActive && lastAppliedState == .recording
+        blurLayer.borderWidth = active ? 1.6 : 0
+        blurLayer.borderColor = active ? FlowPillController.claudeOrange.cgColor : nil
+    }
+
+    func setFocusMode(_ active: Bool) {
+        DispatchQueue.main.async {
+            self.focusModeActive = active
+            self.applyFocusBorder()
+        }
     }
 
     private func stopAnimations() {
@@ -603,7 +622,11 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private enum PaneDeliveryTarget {
         case pane(Int)
         case clipboard
+        case focusedField  // upgraded via double-tap on pane 1: paste like the Right-Cmd path
     }
+    private var paneFocusActive: Bool = false
+    private let paneFocusUpgradeWindowMs: Int = 350
+    private let paneFocusUpgradeIndex: Int = 0  // pane 1 (0-indexed)
     private var isRecordingPane = false
     private var isProcessingPane = false
     private var paneAudioURL: URL?
@@ -2488,13 +2511,42 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func handlePanePressTransition(idx: Int) {
         if let active = activePanePttIndex {
-            // Already recording — same button = send, different button = redirect to clipboard.
-            activePanePttIndex = nil
+            // Recording in progress.
+            if paneFocusActive {
+                // Focus mode (double-tap-promoted): same button = stop+paste, other button = cancel.
+                if active == idx {
+                    logLine("FLOW pane_focus_stop_paste pane=\(idx + 1)")
+                    activePanePttIndex = nil
+                    paneFocusActive = false
+                    pill.setFocusMode(false)
+                    stopPaneRecordingAndDeliver(target: .focusedField)
+                } else {
+                    logLine("FLOW pane_focus_cancelled trigger=\(idx + 1)")
+                    paneFocusActive = false
+                    pill.setFocusMode(false)
+                    cancelPaneRecording()
+                }
+                return
+            }
+
+            // Normal pane recording.
             if active == idx {
+                // Same button: check for focus-mode upgrade window (only on pane 1).
+                let elapsed = Date().timeIntervalSince(paneRecordingStartedAt)
+                let upgradeWindow = Double(paneFocusUpgradeWindowMs) / 1000.0
+                if active == paneFocusUpgradeIndex && elapsed < upgradeWindow {
+                    paneFocusActive = true
+                    pill.setFocusMode(true)
+                    logLine("FLOW pane_focus_upgraded pane=\(idx + 1) elapsed=\(String(format: "%.3f", elapsed))")
+                    return
+                }
                 logLine("FLOW pane_tap_stop_send pane=\(idx + 1)")
+                activePanePttIndex = nil
                 stopPaneRecordingAndDeliver(target: .pane(idx + 1))
             } else {
+                // Different button: clipboard redirect.
                 logLine("FLOW pane_tap_redirect_clipboard from=\(active + 1) trigger=\(idx + 1)")
+                activePanePttIndex = nil
                 stopPaneRecordingAndDeliver(target: .clipboard)
             }
             return
@@ -2720,6 +2772,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logLine("FLOW pane_recording_cancelled")
         isRecordingPane = false
         activePanePttIndex = nil
+        paneFocusActive = false
+        pill.setFocusMode(false)
         stopPaneMeterUpdates()
         preRollLock.lock()
         paneRecordingActive = false
@@ -2741,10 +2795,17 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch target {
         case .pane(let p): return "pane=\(p)"
         case .clipboard: return "clipboard"
+        case .focusedField: return "focusedField"
         }
     }
 
     private func processPaneAudio(_ fileURL: URL, target: PaneDeliveryTarget) async {
+        if case .focusedField = target {
+            // Run the full Right-Cmd pipeline (clean, polish, translate, paste/copy per outputMode).
+            // processAudio takes care of file cleanup and pill states.
+            await processAudio(fileURL)
+            return
+        }
         defer {
             try? FileManager.default.removeItem(at: fileURL)
         }
@@ -2765,6 +2826,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     NSPasteboard.general.setString(trimmed, forType: .string)
                 }
                 logLine("FLOW pane_transcript_clipboard chars=\(trimmed.count)")
+            case .focusedField:
+                break  // already handled above
             }
             addToHistory(trimmed)
             playSuccessSound()
