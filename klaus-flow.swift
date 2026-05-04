@@ -593,6 +593,38 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var fallbackHotKeyHandler: EventHandlerRef?
     private let allowEitherCommand = false
 
+    // MARK: - Pane PTT (Cmd+Shift+1..4 → POST transcript to remote pane composer)
+    fileprivate let paneHotKeySignature: OSType = 0x504e504b   // 'PNPK'
+    private var paneHotKeyRefs: [EventHotKeyRef?] = [nil, nil, nil, nil]
+    fileprivate var paneHotKeyDown: [Bool] = [false, false, false, false]
+    private var previousPaneHotKeyDown: [Bool] = [false, false, false, false]
+    private var activePanePttIndex: Int? = nil
+
+    private enum PaneDeliveryTarget {
+        case pane(Int)
+        case clipboard
+    }
+    private var isRecordingPane = false
+    private var isProcessingPane = false
+    private var paneAudioURL: URL?
+    private var paneRecordingStartedAt = Date.distantPast
+    private var paneRecordingMaxLevel: CGFloat = 0.0
+    private var paneProcessingTask: Task<Void, Never>?
+    private var paneRecordingMeterTimer: Timer?
+
+    // Pre-Roll-Ringbuffer für Klaus-Mic-/Pane-PTT: schneidet abgeschnittene Anfangssilben
+    // weg, indem ~preRollMillis Audio vor dem Press-Event als Prefix vor das frisch
+    // aufgenommene Material gehängt werden. Nur für den Pane-Pfad aktiv.
+    private let preRollMillis: Int = 500
+    private var preRollEngine: AVAudioEngine?
+    private var preRollFormat: AVAudioFormat?
+    private var preRollRing: [AVAudioPCMBuffer] = []
+    private var preRollRingFrames: AVAudioFramePosition = 0
+    private var paneAudioFile: AVAudioFile?
+    private var paneRecordingActive: Bool = false
+    private var lastPaneAudioPower: Float = -160.0
+    private let preRollLock = NSLock()
+
     private var outputMode: OutputMode {
         get {
             let raw = UserDefaults.standard.integer(forKey: OutputMode.defaultsKey)
@@ -770,6 +802,34 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var dictionaryFileURL: URL {
         flowHomeURL.appendingPathComponent("dictionary.json")
+    }
+
+    private var paneTokenFileURL: URL {
+        flowHomeURL.appendingPathComponent("pane-token")
+    }
+
+    private var paneEndpointURL: URL {
+        let raw = ProcessInfo.processInfo.environment["KLAUSFLOW_PANE_ENDPOINT"]
+            ?? UserDefaults.standard.string(forKey: "KlausFlowPaneEndpoint")
+            ?? "https://klauss-mac-studio.tail4b628d.ts.net:8890/api/pane-input"
+        return URL(string: raw)
+            ?? URL(string: "https://klauss-mac-studio.tail4b628d.ts.net:8890/api/pane-input")!
+    }
+
+    private var paneAuthToken: String {
+        if let env = ProcessInfo.processInfo.environment["KLAUSFLOW_PANE_TOKEN"], !env.isEmpty {
+            return env
+        }
+        if let data = try? Data(contentsOf: paneTokenFileURL),
+           let str = String(data: data, encoding: .utf8) {
+            let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return UserDefaults.standard.string(forKey: "KlausFlowPaneToken") ?? ""
+    }
+
+    private var paneClientId: String {
+        Host.current().localizedName ?? ProcessInfo.processInfo.hostName
     }
 
     func run() {
@@ -991,6 +1051,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hotkeyPollTimer = timer
         RunLoop.main.add(timer, forMode: .common)
         setupFallbackHotkey()
+        setupPaneHotkeys()
     }
 
     private func setupFallbackHotkey() {
@@ -1012,11 +1073,23 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 nil,
                 &hotKeyID
             )
-            guard status == noErr, hotKeyID.signature == app.fallbackHotKeySignature else { return noErr }
+            guard status == noErr else { return noErr }
             let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
-            DispatchQueue.main.async {
-                app.fallbackHotkeyDown = pressed
-                app.syncHotkeyState()
+            let sig = hotKeyID.signature
+            let id = hotKeyID.id
+            if sig == app.fallbackHotKeySignature {
+                DispatchQueue.main.async {
+                    app.fallbackHotkeyDown = pressed
+                    app.syncHotkeyState()
+                }
+            } else if sig == app.paneHotKeySignature {
+                let idx = Int(id) - 10
+                if idx >= 0 && idx < 4 {
+                    DispatchQueue.main.async {
+                        app.paneHotKeyDown[idx] = pressed
+                        app.syncPaneHotkeyState()
+                    }
+                }
             }
             return noErr
         }
@@ -1033,9 +1106,14 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func pollEscapeKey() {
         let escapeDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(53))
-        if escapeDown && !escapeWasDown && isRecording {
-            logLine("FLOW escape_pressed — cancelling recording")
-            cancelRecording()
+        if escapeDown && !escapeWasDown {
+            if isRecording {
+                logLine("FLOW escape_pressed — cancelling recording")
+                cancelRecording()
+            } else if isRecordingPane {
+                logLine("FLOW escape_pressed — cancelling pane recording")
+                cancelPaneRecording()
+            }
         }
         escapeWasDown = escapeDown
     }
@@ -1089,10 +1167,17 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func syncHotkeyState() {
-        let pressed = fallbackHotkeyDown || rightCommandDown || (allowEitherCommand && leftCommandDown)
+        let rawPressed = fallbackHotkeyDown || rightCommandDown || (allowEitherCommand && leftCommandDown)
+        // First-pressed wins: while pane PTT is busy, don't activate regular PTT.
+        // Releases (transitions false) are always honored so we don't get stuck.
+        let paneBusy = activePanePttIndex != nil || isRecordingPane || isProcessingPane
+        let pressed = rawPressed && !(paneBusy && !pttDown)
         guard pressed != pttDown else { return }
         pttDown = pressed
-        logLine("FLOW ptt_state pressed=\(pressed) rightCommand=\(rightCommandDown) leftCommand=\(leftCommandDown) fallback=\(fallbackHotkeyDown)")
+        logLine("FLOW ptt_state pressed=\(pressed) rightCommand=\(rightCommandDown) leftCommand=\(leftCommandDown) fallback=\(fallbackHotkeyDown) paneBusy=\(paneBusy)")
+        if pressed {
+            sendStopAudioFireAndForget()
+        }
         if !pressed {
             cancelledWhileHeld = false
             scheduleStopRecordingIfNeeded()
@@ -1913,6 +1998,28 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? seed.write(to: dictionaryFileURL, atomically: true, encoding: .utf8)
     }
 
+    private func sendStopAudioFireAndForget() {
+        let token = paneAuthToken
+        guard !token.isEmpty,
+              let url = URL(string: "https://klauss-mac-studio.tail4b628d.ts.net:8890/api/voice/stop-audio") else {
+            return
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 1.0
+        Task {
+            do {
+                let (_, response) = try await URLSession.shared.data(for: req)
+                if let http = response as? HTTPURLResponse {
+                    self.logLine("FLOW stop_audio_sent status=\(http.statusCode)")
+                }
+            } catch {
+                self.logLine("FLOW stop_audio_error \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func sendToKlausBotIfRunning(_ text: String) async -> Bool {
         // Try to reach the Klaus bot on localhost:9921
         // If it responds, send the text as a command and return true
@@ -2347,6 +2454,379 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    // MARK: - Pane PTT pipeline
+
+    private func setupPaneHotkeys() {
+        let modifiers = UInt32(cmdKey)
+        let virtualKeys: [Int] = [kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4]
+        for (idx, vk) in virtualKeys.enumerated() {
+            let id = EventHotKeyID(signature: paneHotKeySignature, id: UInt32(idx + 10))
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(vk), modifiers, id, GetApplicationEventTarget(), 0, &ref)
+            if status == noErr {
+                paneHotKeyRefs[idx] = ref
+            } else {
+                logLine("FLOW pane_hotkey_register_failed pane=\(idx + 1) status=\(status)")
+            }
+        }
+        logLine("FLOW pane_hotkeys_ready cmd+1..4 endpoint=\(paneEndpointURL.absoluteString) tokenSet=\(!paneAuthToken.isEmpty)")
+    }
+
+    fileprivate func syncPaneHotkeyState() {
+        // Transition-based: react only on press transitions (false → true).
+        // Releases just update the previous-state mirror.
+        defer { previousPaneHotKeyDown = paneHotKeyDown }
+        for idx in 0..<paneHotKeyDown.count {
+            let wasDown = previousPaneHotKeyDown[idx]
+            let isDown = paneHotKeyDown[idx]
+            guard !wasDown, isDown else { continue }
+            handlePanePressTransition(idx: idx)
+        }
+    }
+
+    private func handlePanePressTransition(idx: Int) {
+        if let active = activePanePttIndex {
+            // Already recording — same button = send, different button = redirect to clipboard.
+            activePanePttIndex = nil
+            if active == idx {
+                logLine("FLOW pane_tap_stop_send pane=\(idx + 1)")
+                stopPaneRecordingAndDeliver(target: .pane(idx + 1))
+            } else {
+                logLine("FLOW pane_tap_redirect_clipboard from=\(active + 1) trigger=\(idx + 1)")
+                stopPaneRecordingAndDeliver(target: .clipboard)
+            }
+            return
+        }
+
+        // Idle → start a fresh recording targeting this pane.
+        if pttDown || isRecording || isProcessing {
+            logLine("FLOW pane_ptt_blocked_by_regular pane=\(idx + 1)")
+            return
+        }
+        if isProcessingPane {
+            logLine("FLOW pane_ptt_blocked_by_processing pane=\(idx + 1)")
+            return
+        }
+        activePanePttIndex = idx
+        startPaneRecording(targetPane: idx + 1)
+    }
+
+    private func ensurePreRollEngine() {
+        guard preRollEngine == nil else { return }
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0 else {
+            logLine("FLOW preroll_engine_no_input_format")
+            return
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.handlePreRollTap(buffer: buffer)
+        }
+        do {
+            try engine.start()
+            preRollEngine = engine
+            preRollFormat = format
+            logLine("FLOW preroll_engine_started sampleRate=\(format.sampleRate) channels=\(format.channelCount)")
+        } catch {
+            input.removeTap(onBus: 0)
+            logLine("FLOW preroll_engine_start_failed \(error.localizedDescription)")
+        }
+    }
+
+    private func handlePreRollTap(buffer: AVAudioPCMBuffer) {
+        guard let format = preRollFormat else { return }
+        guard let copy = copyPCMBuffer(buffer) else { return }
+
+        let power = computeAveragePower(buffer)
+
+        preRollLock.lock()
+        lastPaneAudioPower = power
+
+        preRollRing.append(copy)
+        preRollRingFrames += AVAudioFramePosition(copy.frameLength)
+        let maxFrames = AVAudioFramePosition(Double(preRollMillis) * format.sampleRate / 1000.0)
+        while preRollRing.count > 1, preRollRingFrames - AVAudioFramePosition(preRollRing[0].frameLength) >= maxFrames {
+            let removed = preRollRing.removeFirst()
+            preRollRingFrames -= AVAudioFramePosition(removed.frameLength)
+        }
+
+        let writeActive = paneRecordingActive
+        let file = paneAudioFile
+        preRollLock.unlock()
+
+        if writeActive, let file {
+            do {
+                try file.write(from: copy)
+            } catch {
+                // Fire-and-forget: lost frames are recoverable, don't crash the audio thread.
+            }
+        }
+    }
+
+    private func copyPCMBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format, frameCapacity: source.frameLength) else {
+            return nil
+        }
+        copy.frameLength = source.frameLength
+        let channelCount = Int(source.format.channelCount)
+        let frameLength = Int(source.frameLength)
+        if let src = source.floatChannelData, let dst = copy.floatChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], frameLength * MemoryLayout<Float>.size)
+            }
+        } else if let src = source.int16ChannelData, let dst = copy.int16ChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], frameLength * MemoryLayout<Int16>.size)
+            }
+        } else if let src = source.int32ChannelData, let dst = copy.int32ChannelData {
+            for ch in 0..<channelCount {
+                memcpy(dst[ch], src[ch], frameLength * MemoryLayout<Int32>.size)
+            }
+        } else {
+            return nil
+        }
+        return copy
+    }
+
+    private func computeAveragePower(_ buffer: AVAudioPCMBuffer) -> Float {
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return -160.0 }
+        var sumSquares: Float = 0
+        if let data = buffer.floatChannelData?[0] {
+            for i in 0..<frameLength {
+                let s = data[i]
+                sumSquares += s * s
+            }
+            let rms = sqrtf(sumSquares / Float(frameLength))
+            return 20 * log10f(max(rms, 1e-9))
+        } else if let data = buffer.int16ChannelData?[0] {
+            for i in 0..<frameLength {
+                let s = Float(data[i]) / 32768.0
+                sumSquares += s * s
+            }
+            let rms = sqrtf(sumSquares / Float(frameLength))
+            return 20 * log10f(max(rms, 1e-9))
+        }
+        return -160.0
+    }
+
+    private func startPaneRecording(targetPane pane: Int) {
+        guard !isRecordingPane else { return }
+        if paused { return }
+
+        ensurePreRollEngine()
+        guard let format = preRollFormat else {
+            logLine("FLOW pane_recording_failed pane=\(pane) error=preroll_engine_unavailable")
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            activePanePttIndex = nil
+            return
+        }
+
+        do {
+            let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("klaus-flow-pane-\(UUID().uuidString).wav")
+            let file = try AVAudioFile(
+                forWriting: tmp,
+                settings: format.settings,
+                commonFormat: format.commonFormat,
+                interleaved: format.isInterleaved
+            )
+
+            preRollLock.lock()
+            let preRollSnapshot = preRollRing
+            let preRollFrames = preRollRingFrames
+            preRollLock.unlock()
+
+            for buf in preRollSnapshot {
+                try file.write(from: buf)
+            }
+
+            preRollLock.lock()
+            paneAudioFile = file
+            paneRecordingActive = true
+            preRollLock.unlock()
+
+            paneAudioURL = tmp
+            isRecordingPane = true
+            paneRecordingStartedAt = Date()
+            paneRecordingMaxLevel = 0.0
+            let preRollMs = Int(Double(preRollFrames) * 1000.0 / format.sampleRate)
+            logLine("FLOW pane_recording_started pane=\(pane) path=\(tmp.path) preRollMs=\(preRollMs)")
+            pill.resetRecordingWave()
+            pill.show(state: .recording, mode: outputMode)
+            startPaneMeterUpdates()
+        } catch {
+            preRollLock.lock()
+            paneRecordingActive = false
+            paneAudioFile = nil
+            preRollLock.unlock()
+            logLine("FLOW pane_recording_failed pane=\(pane) error=\(error.localizedDescription)")
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            activePanePttIndex = nil
+        }
+    }
+
+    private func stopPaneRecordingAndDeliver(target: PaneDeliveryTarget) {
+        guard isRecordingPane else {
+            // Edge case: keys released before recording even started (e.g. during init)
+            return
+        }
+        isRecordingPane = false
+        stopPaneMeterUpdates()
+        preRollLock.lock()
+        paneRecordingActive = false
+        paneAudioFile = nil
+        preRollRing.removeAll(keepingCapacity: true)
+        preRollRingFrames = 0
+        lastPaneAudioPower = -160.0
+        preRollLock.unlock()
+        let duration = max(0, Date().timeIntervalSince(paneRecordingStartedAt))
+        paneRecordingStartedAt = Date.distantPast
+        let capturedMaxLevel = paneRecordingMaxLevel
+        paneRecordingMaxLevel = 0.0
+        let targetLabel = paneTargetLabel(target)
+        logLine("FLOW pane_recording_stopped target=\(targetLabel) duration=\(String(format: "%.2f", duration)) maxLevel=\(String(format: "%.3f", capturedMaxLevel))")
+
+        guard let url = paneAudioURL else {
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            return
+        }
+        paneAudioURL = nil
+
+        if duration < minSpeechRecordingDuration || capturedMaxLevel < minSpeechPeakLevel {
+            logLine("FLOW pane_recording_skipped_silence target=\(targetLabel)")
+            try? FileManager.default.removeItem(at: url)
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.0)
+            return
+        }
+
+        isProcessingPane = true
+        pill.show(state: .processing, mode: outputMode)
+        paneProcessingTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.isProcessingPane = false
+                self.paneProcessingTask = nil
+            }
+            await self.processPaneAudio(url, target: target)
+        }
+    }
+
+    private func cancelPaneRecording() {
+        guard isRecordingPane else { return }
+        logLine("FLOW pane_recording_cancelled")
+        isRecordingPane = false
+        activePanePttIndex = nil
+        stopPaneMeterUpdates()
+        preRollLock.lock()
+        paneRecordingActive = false
+        paneAudioFile = nil
+        preRollRing.removeAll(keepingCapacity: true)
+        preRollRingFrames = 0
+        lastPaneAudioPower = -160.0
+        preRollLock.unlock()
+        paneRecordingStartedAt = Date.distantPast
+        paneRecordingMaxLevel = 0.0
+        if let url = paneAudioURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        paneAudioURL = nil
+        pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+    }
+
+    private func paneTargetLabel(_ target: PaneDeliveryTarget) -> String {
+        switch target {
+        case .pane(let p): return "pane=\(p)"
+        case .clipboard: return "clipboard"
+        }
+    }
+
+    private func processPaneAudio(_ fileURL: URL, target: PaneDeliveryTarget) async {
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
+        do {
+            let raw = try await transcribe(fileURL)
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            logLine("FLOW pane_transcript target=\(paneTargetLabel(target)) text=\(trimmed)")
+            guard !trimmed.isEmpty else {
+                await showPill(.failure, autoHideAfter: 1.2)
+                return
+            }
+            switch target {
+            case .pane(let pane):
+                try await postToPane(pane, text: trimmed)
+            case .clipboard:
+                await MainActor.run {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(trimmed, forType: .string)
+                }
+                logLine("FLOW pane_transcript_clipboard chars=\(trimmed.count)")
+            }
+            addToHistory(trimmed)
+            playSuccessSound()
+            await showPill(.success, autoHideAfter: 1.0)
+        } catch {
+            logLine("FLOW pane_process_error target=\(paneTargetLabel(target)) error=\(error.localizedDescription)")
+            await showPill(.failure, autoHideAfter: 1.5)
+        }
+    }
+
+    private func postToPane(_ pane: Int, text: String) async throws {
+        let token = paneAuthToken
+        guard !token.isEmpty else {
+            throw NSError(domain: "pane", code: 401, userInfo: [
+                NSLocalizedDescriptionKey: "KLAUSFLOW_PANE_TOKEN nicht gesetzt (env oder ~/.klaus-flow/pane-token)"
+            ])
+        }
+        var req = URLRequest(url: paneEndpointURL)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 8
+        let body: [String: Any] = [
+            "pane": pane,
+            "text": text,
+            "source": "klaus-flow-ptt",
+            "client_id": paneClientId
+        ]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "pane", code: 0, userInfo: [NSLocalizedDescriptionKey: "Ungültige Antwort"])
+        }
+        let respText = String(data: data, encoding: .utf8) ?? "-"
+        guard (200..<300).contains(http.statusCode) else {
+            throw NSError(domain: "pane", code: http.statusCode, userInfo: [
+                NSLocalizedDescriptionKey: "Pane POST \(http.statusCode): \(respText)"
+            ])
+        }
+        logLine("FLOW pane_post_ok pane=\(pane) status=\(http.statusCode) resp=\(respText)")
+    }
+
+    private func startPaneMeterUpdates() {
+        paneRecordingMeterTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.isRecordingPane else { return }
+            self.preRollLock.lock()
+            let power = self.lastPaneAudioPower
+            self.preRollLock.unlock()
+            let level = self.normalizedAudioLevel(fromPower: power)
+            if level > self.paneRecordingMaxLevel { self.paneRecordingMaxLevel = level }
+            self.pill.updateRecordingLevel(level)
+        }
+        paneRecordingMeterTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopPaneMeterUpdates() {
+        paneRecordingMeterTimer?.invalidate()
+        paneRecordingMeterTimer = nil
     }
 
     func menuWillOpen(_ menu: NSMenu) {
