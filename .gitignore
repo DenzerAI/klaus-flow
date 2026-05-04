@@ -1,0 +1,25 @@
+# Secrets — Bearer tokens, API keys
+pane-token
+*.token
+
+# Build artifacts
+klaus-flow
+klaus-flow.build
+build.log
+
+# Backups (file-based snapshots, pre-git)
+*.bak
+*.bak.*
+*.backup
+
+# Runtime
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# Python venv
+.venv/
+__pycache__/
+*.pyc

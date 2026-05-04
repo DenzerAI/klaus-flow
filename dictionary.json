@@ -1,0 +1,12 @@
+{
+  "replacements": {
+      "D": "Groq",
+    "grog": "Groq",
+    "Moin, Zen": "Moinsen",
+    "grock": "Groq",
+    "open claw": "OpenClaw",
+    "claude": "Claude",
+    "claude code": "Claude Code",
+    "klaus flow": "Klaus Flow"
+  }
+}
