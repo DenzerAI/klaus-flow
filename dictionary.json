@@ -1,7 +1,11 @@
 {
-  "replacements": {
-      "D": "Groq",
+  "replacements":
+      "Dancer": "Denzer",
+      "Dancer punkt ai": "denzer.ai",
+      "Gekko": "Gecko",
+      "Geco": "Gecko",
     "grog": "Groq",
+    "Fitnesszentrum": "Fitnesscentrum",
     "Moin, Zen": "Moinsen",
     "grock": "Groq",
     "open claw": "OpenClaw",

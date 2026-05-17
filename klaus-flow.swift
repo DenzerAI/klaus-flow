@@ -4,7 +4,6 @@ import AVFoundation
 import ApplicationServices
 import Carbon.HIToolbox
 
-private let nxDeviceLCmdKeyMask: UInt = 0x00000008
 private let nxDeviceRCmdKeyMask: UInt = 0x00000010
 
 private enum OutputMode: Int {
@@ -16,9 +15,9 @@ private enum OutputMode: Int {
     var title: String {
         switch self {
         case .paste:
-            return "Einfügen"
+            return "Nur einfügen"
         case .pasteSend:
-            return "Einfügen + Senden"
+            return "Einfügen + Enter senden"
         }
     }
 }
@@ -67,31 +66,49 @@ private final class FloatingPanel: NSPanel {
 }
 
 private final class FlowPillController: NSWindowController {
-    private let symbolLabel = NSTextField(labelWithString: " ")
-    private let blurView = NSVisualEffectView()
-    private let logoView = NSImageView()
-    private let ambientGlowLayer = CAGradientLayer()
-    private let topHighlightLayer = CAGradientLayer()
-    private let bottomShadeLayer = CAGradientLayer()
-    private let waveContainer = CALayer()
-    private let dotsContainer = CALayer()
-    private var recordingBars: [CALayer] = []
-    private var dotLayers: [CALayer] = []
-    private var waveSamples: [CGFloat] = []
+    // Layout
+    fileprivate static let klausSize: CGFloat = 48
+    fileprivate static let chipHeight: CGFloat = 22
+    fileprivate static let chipGap: CGFloat = 6
+    fileprivate static let windowWidth: CGFloat = 120
+    fileprivate static let windowHeight: CGFloat = klausSize + chipGap + chipHeight  // 76
+
+    // Colors
+    fileprivate static let klausDark = NSColor(red: 31.0/255, green: 31.0/255, blue: 30.0/255, alpha: 1.0)
+    fileprivate static let klausCream = NSColor(red: 230.0/255, green: 230.0/255, blue: 227.0/255, alpha: 1.0)
+    // Anthropic Coral — base #D97757, bright #E89478 (pulse high)
+    fileprivate static let claudeOrange = NSColor(calibratedRed: 217.0/255, green: 119.0/255, blue: 87.0/255, alpha: 1.0)
+    fileprivate static let claudeOrangeBright = NSColor(calibratedRed: 232.0/255, green: 148.0/255, blue: 120.0/255, alpha: 1.0)
+    fileprivate static let recordingRed = NSColor(red: 255.0/255, green: 95.0/255, blue: 92.0/255, alpha: 1.0)
+    fileprivate static let borderWhite = NSColor.white.withAlphaComponent(0.55)
+
+    // Klaus layers
+    private var contentView: NSView!
+    private var klausCircleLayer: CAShapeLayer!
+    private var klausBars: [CALayer] = []
+    private var klausCheckLayer: CAShapeLayer!
+    private var klausXLayer: CAShapeLayer!
+
+    // Chip
+    private var chipBackground: NSView!
+    private var chipLabel: NSTextField!
+
+    // State
     private var hideWorkItem: DispatchWorkItem?
-    private var processingDotsTimer: Timer?
-    private var processingDotsStep = 0
-    private var recordingPhase: CGFloat = 0.0
-    private let processingPulseKey = "pill.processingPulse"
-    private let symbolPopKey = "pill.symbolPop"
-    private var recordingLevel: CGFloat = 0.0
+    private var mouseTrackingTimer: Timer?
+    private var idleBlinkTimer: Timer?
+    private var recordingTimeText: String = ""
+    private var activePaneIndex: Int? = nil
     private var focusModeActive: Bool = false
     private var lastAppliedState: PillState = .hidden
-    private static let claudeOrange = NSColor(calibratedRed: 217.0/255, green: 119.0/255, blue: 87.0/255, alpha: 1.0)
+    private var invertedMode: Bool = false
+    // Recording animation state — smoothed amplitude per bar + continuous phase
+    private var amplitudeHistory: [CGFloat] = []
+    private var amplitudePhase: CGFloat = 0.0
 
     override init(window: NSWindow?) {
         let panel = FloatingPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 110, height: 46),
+            contentRect: NSRect(x: 0, y: 0, width: Self.windowWidth, height: Self.windowHeight),
             styleMask: [.nonactivatingPanel, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -104,7 +121,7 @@ private final class FlowPillController: NSWindowController {
         panel.isMovableByWindowBackground = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false
         super.init(window: panel)
         setupUI(panel)
         hideImmediately()
@@ -115,113 +132,135 @@ private final class FlowPillController: NSWindowController {
     }
 
     private func setupUI(_ panel: NSPanel) {
-        blurView.frame = panel.contentView?.bounds ?? .zero
-        blurView.autoresizingMask = [.width, .height]
-        blurView.material = .hudWindow
-        blurView.blendingMode = .behindWindow
-        blurView.state = .active
-        blurView.wantsLayer = true
-        blurView.layer?.cornerRadius = 23
-        blurView.layer?.cornerCurve = .continuous
-        blurView.layer?.masksToBounds = false
-        blurView.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.003).cgColor
-        blurView.layer?.borderWidth = 0
-        blurView.layer?.shadowColor = NSColor.black.cgColor
-        blurView.layer?.shadowOpacity = 0.045
-        blurView.layer?.shadowRadius = 20
-        blurView.layer?.shadowOffset = CGSize(width: 0, height: -6)
+        let content = NSView(frame: panel.contentView?.bounds ?? .zero)
+        content.autoresizingMask = [.width, .height]
+        content.wantsLayer = true
+        content.layer?.backgroundColor = NSColor.clear.cgColor
+        panel.contentView = content
+        self.contentView = content
 
-        let maskLayer = CAShapeLayer()
-        let maskRect = blurView.bounds
-        let maskPath = NSBezierPath(roundedRect: maskRect, xRadius: 23, yRadius: 23)
-        maskLayer.path = maskPath.cgPath
-        maskLayer.fillColor = NSColor.white.cgColor
-        blurView.layer?.mask = maskLayer
-        blurView.layer?.allowsEdgeAntialiasing = true
-        panel.contentView = blurView
+        guard let root = content.layer else { return }
 
-        if let rootLayer = blurView.layer {
-            ambientGlowLayer.type = .radial
-            ambientGlowLayer.colors = [
-                NSColor.white.withAlphaComponent(0.13).cgColor,
-                NSColor.white.withAlphaComponent(0.045).cgColor,
-                NSColor.clear.cgColor
-            ]
-            ambientGlowLayer.startPoint = CGPoint(x: 0.32, y: 0.1)
-            ambientGlowLayer.endPoint = CGPoint(x: 0.76, y: 0.92)
-            ambientGlowLayer.opacity = 0.95
-            rootLayer.addSublayer(ambientGlowLayer)
+        let scale = Self.klausSize / 200.0
+        let klausX = (Self.windowWidth - Self.klausSize) / 2
+        let klausY = Self.chipHeight + Self.chipGap  // Klaus sits above chip area
+        let klausFrame = CGRect(x: klausX, y: klausY, width: Self.klausSize, height: Self.klausSize)
+        let klausBounds = CGRect(x: 0, y: 0, width: Self.klausSize, height: Self.klausSize)
 
-            topHighlightLayer.colors = [
-                NSColor.white.withAlphaComponent(0.12).cgColor,
-                NSColor.white.withAlphaComponent(0.03).cgColor,
-                NSColor.clear.cgColor
-            ]
-            topHighlightLayer.locations = [0.0, 0.38, 1.0]
-            topHighlightLayer.startPoint = CGPoint(x: 0.5, y: 1.0)
-            topHighlightLayer.endPoint = CGPoint(x: 0.5, y: 0.0)
-            topHighlightLayer.opacity = 0.9
-            rootLayer.addSublayer(topHighlightLayer)
+        // Klaus circle with shadow and stroke
+        let circle = CAShapeLayer()
+        circle.frame = klausFrame
+        circle.bounds = klausBounds
+        let inset: CGFloat = 1.0
+        circle.path = CGPath(ellipseIn: klausBounds.insetBy(dx: inset, dy: inset), transform: nil)
+        circle.fillColor = Self.klausDark.cgColor
+        circle.strokeColor = Self.borderWhite.cgColor
+        circle.lineWidth = 0
+        circle.shadowColor = NSColor.black.cgColor
+        circle.shadowOpacity = 0.3
+        circle.shadowRadius = 4
+        circle.shadowOffset = CGSize(width: 0, height: -2)
+        root.addSublayer(circle)
+        klausCircleLayer = circle
 
-            bottomShadeLayer.colors = [
-                NSColor.clear.cgColor,
-                NSColor.black.withAlphaComponent(0.04).cgColor,
-                NSColor.black.withAlphaComponent(0.08).cgColor
-            ]
-            bottomShadeLayer.locations = [0.0, 0.72, 1.0]
-            bottomShadeLayer.startPoint = CGPoint(x: 0.5, y: 1.0)
-            bottomShadeLayer.endPoint = CGPoint(x: 0.5, y: 0.0)
-            bottomShadeLayer.opacity = 0.7
-            rootLayer.addSublayer(bottomShadeLayer)
-
-            waveContainer.opacity = 0.0
-            rootLayer.addSublayer(waveContainer)
-            for _ in 0..<17 {
-                let bar = CALayer()
-                bar.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
-                bar.cornerRadius = 0.75
-                bar.opacity = 0.16
-                waveContainer.addSublayer(bar)
-                recordingBars.append(bar)
-            }
-
-            dotsContainer.opacity = 0.0
-            rootLayer.addSublayer(dotsContainer)
-            for _ in 0..<3 {
-                let dot = CALayer()
-                dot.backgroundColor = NSColor.white.withAlphaComponent(0.96).cgColor
-                dot.cornerRadius = 3.0
-                dot.opacity = 0.28
-                dotsContainer.addSublayer(dot)
-                dotLayers.append(dot)
-            }
+        // 5 bars (anchor 0.5,0.5 by default → scaleY scales from center)
+        let barWidth: CGFloat = 14 * scale
+        let barXs: [CGFloat] = [49, 71, 93, 115, 137].map { $0 * scale }
+        let barHeights: [CGFloat] = [58, 82, 104, 82, 58].map { $0 * scale }
+        for i in 0..<5 {
+            let bar = CALayer()
+            let bx = klausX + barXs[i]
+            let by = klausY + (Self.klausSize - barHeights[i]) / 2
+            bar.frame = CGRect(x: bx, y: by, width: barWidth, height: barHeights[i])
+            bar.backgroundColor = Self.klausCream.cgColor
+            bar.cornerRadius = barWidth / 2
+            root.addSublayer(bar)
+            klausBars.append(bar)
         }
 
-        logoView.image = loadLogoImage()
-        logoView.imageScaling = .scaleProportionallyUpOrDown
-        logoView.contentTintColor = NSColor.white.withAlphaComponent(0.98)
-        logoView.translatesAutoresizingMaskIntoConstraints = false
-        logoView.isHidden = true
-        logoView.wantsLayer = true
-        blurView.addSubview(logoView)
+        // Check overlay (hidden by default)
+        let check = CAShapeLayer()
+        check.frame = klausFrame
+        check.bounds = klausBounds
+        let checkPath = CGMutablePath()
+        // SVG y is flipped to layer y (y up). svg(60,104)→layer(60*s, (200-104)*s)
+        checkPath.move(to: CGPoint(x: 60 * scale, y: (200 - 104) * scale))
+        checkPath.addLine(to: CGPoint(x: 92 * scale, y: (200 - 134) * scale))
+        checkPath.addLine(to: CGPoint(x: 142 * scale, y: (200 - 68) * scale))
+        check.path = checkPath
+        check.strokeColor = Self.klausCream.cgColor
+        check.lineWidth = 16 * scale
+        check.lineCap = .round
+        check.lineJoin = .round
+        check.fillColor = NSColor.clear.cgColor
+        check.opacity = 0
+        root.addSublayer(check)
+        klausCheckLayer = check
 
-        symbolLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-        symbolLabel.textColor = .white
-        symbolLabel.alignment = .center
-        symbolLabel.translatesAutoresizingMaskIntoConstraints = false
-        symbolLabel.isHidden = true
-        symbolLabel.wantsLayer = true
-        blurView.addSubview(symbolLabel)
+        // X overlay (hidden by default)
+        let xLayer = CAShapeLayer()
+        xLayer.frame = klausFrame
+        xLayer.bounds = klausBounds
+        let xPath = CGMutablePath()
+        xPath.move(to: CGPoint(x: 64 * scale, y: (200 - 64) * scale))
+        xPath.addLine(to: CGPoint(x: 136 * scale, y: (200 - 136) * scale))
+        xPath.move(to: CGPoint(x: 136 * scale, y: (200 - 64) * scale))
+        xPath.addLine(to: CGPoint(x: 64 * scale, y: (200 - 136) * scale))
+        xLayer.path = xPath
+        xLayer.strokeColor = Self.klausCream.cgColor
+        xLayer.lineWidth = 16 * scale
+        xLayer.lineCap = .round
+        xLayer.fillColor = NSColor.clear.cgColor
+        xLayer.opacity = 0
+        root.addSublayer(xLayer)
+        klausXLayer = xLayer
 
-        NSLayoutConstraint.activate([
-            logoView.centerXAnchor.constraint(equalTo: blurView.centerXAnchor),
-            logoView.centerYAnchor.constraint(equalTo: blurView.centerYAnchor),
-            logoView.widthAnchor.constraint(equalToConstant: 36),
-            logoView.heightAnchor.constraint(equalToConstant: 20),
-            symbolLabel.centerXAnchor.constraint(equalTo: blurView.centerXAnchor),
-            symbolLabel.centerYAnchor.constraint(equalTo: blurView.centerYAnchor, constant: -0.5)
-        ])
-        layoutDynamicLayers()
+        // Chip
+        let chipBg = NSView(frame: NSRect(x: 0, y: 0, width: 60, height: Self.chipHeight))
+        chipBg.wantsLayer = true
+        let bgLayer = chipBg.layer!
+        bgLayer.backgroundColor = NSColor(red: 26.0/255, green: 26.0/255, blue: 31.0/255, alpha: 0.92).cgColor
+        bgLayer.cornerRadius = Self.chipHeight / 2
+        bgLayer.borderWidth = 0.5
+        bgLayer.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        chipBg.isHidden = true
+        content.addSubview(chipBg)
+        chipBackground = chipBg
+
+        let lbl = NSTextField(labelWithString: "")
+        lbl.isBezeled = false
+        lbl.isEditable = false
+        lbl.drawsBackground = false
+        chipBg.addSubview(lbl)
+        chipLabel = lbl
+
+        // Initial colors based on inverted preference
+        invertedMode = UserDefaults.standard.bool(forKey: "KlausFlowInverted")
+        applyColorsForMode()
+    }
+
+    fileprivate func setInverted(_ inverted: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.invertedMode = inverted
+            self.applyColorsForMode()
+        }
+    }
+
+    private func applyColorsForMode() {
+        if invertedMode {
+            klausCircleLayer.fillColor = Self.klausCream.cgColor
+            klausCircleLayer.strokeColor = Self.klausDark.cgColor
+            for bar in klausBars { bar.backgroundColor = Self.klausDark.cgColor }
+            klausCheckLayer.strokeColor = Self.klausDark.cgColor
+            klausXLayer.strokeColor = Self.klausDark.cgColor
+        } else {
+            klausCircleLayer.fillColor = Self.klausDark.cgColor
+            klausCircleLayer.strokeColor = Self.borderWhite.cgColor
+            for bar in klausBars { bar.backgroundColor = Self.klausCream.cgColor }
+            klausCheckLayer.strokeColor = Self.klausCream.cgColor
+            klausXLayer.strokeColor = Self.klausCream.cgColor
+        }
     }
 
     func show(state: PillState, mode: OutputMode, autoHideAfter delay: TimeInterval? = nil) {
@@ -230,6 +269,7 @@ private final class FlowPillController: NSWindowController {
             self.hideWorkItem = nil
             self.applyState(state)
             self.positionPanel()
+            self.startMouseTrackingIfEnabled()
             self.window?.alphaValue = 0.0
             self.window?.orderFrontRegardless()
             self.animateIn()
@@ -248,8 +288,11 @@ private final class FlowPillController: NSWindowController {
         DispatchQueue.main.async {
             self.hideWorkItem?.cancel()
             self.hideWorkItem = nil
+            self.stopMouseTracking()
             guard let window = self.window else { return }
-            self.stopAnimations()
+            self.stopAllAnimations()
+            self.focusModeActive = false
+            self.lastAppliedState = .hidden
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.16
                 context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
@@ -260,17 +303,73 @@ private final class FlowPillController: NSWindowController {
         }
     }
 
+    private var pillFollowsMouse: Bool {
+        if UserDefaults.standard.object(forKey: "KlausFlowPillFollowsMouse") == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: "KlausFlowPillFollowsMouse")
+    }
+
+    private func startMouseTrackingIfEnabled() {
+        stopMouseTracking()
+        guard pillFollowsMouse else { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            self?.positionPanel()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        mouseTrackingTimer = timer
+    }
+
+    private func stopMouseTracking() {
+        mouseTrackingTimer?.invalidate()
+        mouseTrackingTimer = nil
+    }
+
     private func positionPanel() {
         guard let window else { return }
+        let size = window.frame.size
+
+        if pillFollowsMouse {
+            let mouse = NSEvent.mouseLocation
+            let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) })
+                ?? NSScreen.main
+                ?? NSScreen.screens.first
+            let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let margin: CGFloat = 8
+
+            // Klaus sits right of cursor sprite, bottom-aligned with cursor bottom.
+            // Cursor sprite is ~14×18; hot-spot is top-left; cursor visually extends down-right.
+            // Klaus is centered horizontally in window (klausInWindowX = (windowWidth - klausSize) / 2 = 36).
+            // klausScreenLeft = mouse.x + cursorWidth + gap = mouse.x + 14 + 8 = mouse.x + 22
+            // → window.left = klausScreenLeft - 36 = mouse.x - 14
+            var x = mouse.x - 14
+            // Flip to left of cursor if running off the right edge.
+            if x + size.width > visible.maxX - margin {
+                // Klaus left of cursor: klausScreenLeft = mouse.x - 8 - klausSize = mouse.x - 56
+                // → window.left = mouse.x - 56 - 36 = mouse.x - 92
+                x = mouse.x - 92
+            }
+            x = max(visible.minX + margin, min(x, visible.maxX - size.width - margin))
+
+            // Klaus bottom = cursor sprite bottom (~mouse.y - 18 in screen coords, y up).
+            // Klaus is in top 48 of 76-tall window. klaus.top = klaus.bottom + 48 = mouse.y + 30.
+            // setFrameTopLeftPoint takes the top y → topY = mouse.y + 30
+            var topY = mouse.y + 30
+            topY = max(visible.minY + size.height + margin, min(topY, visible.maxY - margin))
+
+            window.setFrameTopLeftPoint(NSPoint(x: x, y: topY))
+            return
+        }
+
         let screen = NSScreen.screens.first ?? NSScreen.main
         let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let x = visible.midX - (window.frame.width / 2)
+        let x = visible.midX - (size.width / 2)
         let y = visible.maxY - 10
         window.setFrameTopLeftPoint(NSPoint(x: x, y: y))
     }
 
     private func animateIn() {
-        guard let window, let layer = blurView.layer else { return }
+        guard let window, let layer = contentView?.layer else { return }
         window.alphaValue = 0.0
         layer.removeAllAnimations()
         layer.transform = CATransform3DMakeScale(0.92, 0.92, 1.0)
@@ -279,277 +378,460 @@ private final class FlowPillController: NSWindowController {
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().alphaValue = 1.0
         }
-        let animation = CABasicAnimation(keyPath: "transform.scale")
-        animation.fromValue = 0.95
-        animation.toValue = 1.0
-        animation.duration = 0.26
-        animation.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        layer.add(animation, forKey: "pill.scale")
+        let spring = CASpringAnimation(keyPath: "transform.scale")
+        spring.fromValue = 0.92
+        spring.toValue = 1.0
+        spring.damping = 14
+        spring.stiffness = 180
+        spring.mass = 1
+        spring.initialVelocity = 0
+        spring.duration = spring.settlingDuration
+        layer.add(spring, forKey: "klaus.scale")
         layer.transform = CATransform3DIdentity
     }
 
-    private func loadLogoImage() -> NSImage? {
-        if let url = Bundle.main.url(forResource: "klaus-flow-logo", withExtension: "pdf"),
-           let image = NSImage(contentsOf: url) {
-            image.isTemplate = true
-            return image
-        }
-        return nil
-    }
-
-    private func layoutDynamicLayers() {
-        guard let rootLayer = blurView.layer else { return }
-        if let mask = rootLayer.mask as? CAShapeLayer {
-            let maskPath = NSBezierPath(roundedRect: rootLayer.bounds, xRadius: 23, yRadius: 23)
-            mask.path = maskPath.cgPath
-        }
-        ambientGlowLayer.frame = rootLayer.bounds.insetBy(dx: -14, dy: -12)
-        topHighlightLayer.frame = rootLayer.bounds.insetBy(dx: -2, dy: -2)
-        bottomShadeLayer.frame = rootLayer.bounds.insetBy(dx: -2, dy: -2)
-        waveContainer.frame = rootLayer.bounds
-        dotsContainer.frame = rootLayer.bounds
-
-        let targetSamples = recordingBars.count
-        if waveSamples.count != targetSamples {
-            waveSamples = Array(repeating: 0.0, count: targetSamples)
-            redrawWaveform()
-        }
-
-        let barWidth: CGFloat = 1.5
-        let spacing: CGFloat = 2.0
-        let totalWidth = (CGFloat(recordingBars.count) * barWidth) + (CGFloat(max(0, recordingBars.count - 1)) * spacing)
-        let startX = floor((rootLayer.bounds.width - totalWidth) / 2.0)
-        let centerY = rootLayer.bounds.midY
-        for (index, bar) in recordingBars.enumerated() {
-            let x = startX + (CGFloat(index) * (barWidth + spacing))
-            bar.frame = CGRect(x: x, y: centerY - 0.4, width: barWidth, height: 0.8)
-            bar.cornerRadius = barWidth / 2
-        }
-
-        let dotSize: CGFloat = 6.0
-        let dotSpacing: CGFloat = 8.0
-        let dotTotal = (CGFloat(dotLayers.count) * dotSize) + (CGFloat(max(0, dotLayers.count - 1)) * dotSpacing)
-        let dotStartX = floor((rootLayer.bounds.width - dotTotal) / 2.0)
-        for (index, dot) in dotLayers.enumerated() {
-            let x = dotStartX + (CGFloat(index) * (dotSize + dotSpacing))
-            dot.frame = CGRect(x: x, y: centerY - (dotSize / 2), width: dotSize, height: dotSize)
-            dot.cornerRadius = dotSize / 2
-        }
-    }
+    // MARK: - State
 
     private func applyState(_ state: PillState) {
-        guard let layer = blurView.layer else { return }
-        stopAnimations()
-        layoutDynamicLayers()
-        logoView.isHidden = true
-        symbolLabel.isHidden = true
-        waveContainer.opacity = 0.0
-        dotsContainer.opacity = 0.0
-        layer.backgroundColor = NSColor.white.withAlphaComponent(0.004).cgColor
-        ambientGlowLayer.opacity = 0.9
-        topHighlightLayer.opacity = 0.82
-        bottomShadeLayer.opacity = 0.62
+        stopAllAnimations()
+        lastAppliedState = state
 
         switch state {
         case .hidden:
-            break
+            applyIdleBorder()
         case .recording:
-            layer.backgroundColor = NSColor.white.withAlphaComponent(0.006).cgColor
-            ambientGlowLayer.opacity = 0.96
-            topHighlightLayer.opacity = 0.86
-            bottomShadeLayer.opacity = 0.58
-            waveContainer.opacity = 1.0
-            redrawWaveform()
+            startRecordingAnimation()
+            applyActiveBorderForCurrentMode()
         case .processing:
-            layer.backgroundColor = NSColor.white.withAlphaComponent(0.006).cgColor
-            ambientGlowLayer.opacity = 1.0
-            topHighlightLayer.opacity = 0.9
-            bottomShadeLayer.opacity = 0.54
-            dotsContainer.opacity = 1.0
             startProcessingAnimation()
-        case .success, .failure:
-            symbolLabel.isHidden = false
-            symbolLabel.stringValue = state.symbol
-            symbolLabel.textColor = state.accent
-            startSymbolAnimation()
-            layer.backgroundColor = NSColor.white.withAlphaComponent(0.008).cgColor
-            ambientGlowLayer.opacity = 0.88
-            topHighlightLayer.opacity = 0.72
-            bottomShadeLayer.opacity = 0.5
+            applyActiveBorderForCurrentMode()
+        case .success:
+            startSuccessAnimation()
+            applySuccessFailureBorder()
+        case .failure:
+            startFailureAnimation()
+            applySuccessFailureBorder()
         }
-        lastAppliedState = state
-        applyFocusBorder()
+        updateChipContent()
     }
 
-    private func applyFocusBorder() {
-        guard let blurLayer = blurView.layer else { return }
-        let active = focusModeActive && lastAppliedState == .recording
-        blurLayer.borderWidth = active ? 1.6 : 0
-        blurLayer.borderColor = active ? FlowPillController.claudeOrange.cgColor : nil
+    /// Border während recording/processing — immer orange-pulse (in beiden Modi).
+    /// Differenzierung Normal↔Focus erfolgt über Bars-Color und Chip-Symbol.
+    private func applyActiveBorderForCurrentMode() {
+        applyFocusPulseBorder()
     }
 
-    func setFocusMode(_ active: Bool) {
-        DispatchQueue.main.async {
-            self.focusModeActive = active
-            self.applyFocusBorder()
+    /// Border bei success/failure — orange-pulse wenn Focus, sonst static idle.
+    private func applySuccessFailureBorder() {
+        if focusModeActive {
+            applyFocusPulseBorder()
+        } else {
+            applyIdleBorder()
         }
     }
 
-    private func stopAnimations() {
-        processingDotsTimer?.invalidate()
-        processingDotsTimer = nil
-        processingDotsStep = 0
-        blurView.layer?.removeAnimation(forKey: processingPulseKey)
-        blurView.layer?.removeAnimation(forKey: symbolPopKey)
-        blurView.layer?.removeAnimation(forKey: "pill.processingShimmer")
-        blurView.layer?.removeAnimation(forKey: "pill.flash")
-        logoView.layer?.removeAllAnimations()
-        symbolLabel.layer?.removeAllAnimations()
-        let centerY = waveContainer.bounds.midY
-        for bar in recordingBars {
-            let x = bar.frame.origin.x
-            let width = bar.bounds.width > 0 ? bar.bounds.width : 1.5
-            bar.frame = CGRect(x: x, y: centerY - 0.4, width: width, height: 0.8)
-            bar.opacity = 0.08
+    private func stopAllAnimations() {
+        stopIdleBlink()
+        for bar in klausBars {
+            bar.removeAllAnimations()
+            bar.opacity = 1.0
+            bar.transform = CATransform3DIdentity
+            bar.backgroundColor = (invertedMode ? Self.klausDark : Self.klausCream).cgColor
         }
-        for dot in dotLayers {
-            dot.transform = CATransform3DIdentity
-            dot.opacity = 0.28
+        klausCheckLayer.removeAllAnimations()
+        klausCheckLayer.opacity = 0
+        klausCheckLayer.transform = CATransform3DIdentity
+        klausXLayer.removeAllAnimations()
+        klausXLayer.opacity = 0
+        klausXLayer.transform = CATransform3DIdentity
+    }
+
+    // MARK: - Border
+
+    /// Border ist global deaktiviert — Differenzierung Normal/Focus läuft über
+    /// Bars-Farbe (cream/dark vs orange) und das An/Aus der Pane-Zahl im Chip.
+    private func applyFocusPulseBorder() {
+        klausCircleLayer.removeAnimation(forKey: "klaus.border")
+        klausCircleLayer.lineWidth = 0
+    }
+
+    private func applyIdleBorder() {
+        klausCircleLayer.removeAnimation(forKey: "klaus.border")
+        klausCircleLayer.lineWidth = 0
+    }
+
+    // MARK: - Idle (breathing + blink)
+
+    private func startIdleAnimation() {
+        let durations: [CFTimeInterval] = [3.8, 4.2, 3.5, 4.0, 3.7]
+        let froms: [CGFloat] = [0.70, 0.65, 0.60, 0.67, 0.72]
+        let tos: [CGFloat] = [1.02, 1.05, 1.05, 1.04, 1.00]
+        let delays: [CFTimeInterval] = [0, 0.3, 0.6, 0.45, 0.15]
+        for (i, bar) in klausBars.enumerated() {
+            let breath = CABasicAnimation(keyPath: "transform.scale.y")
+            breath.fromValue = froms[i]
+            breath.toValue = tos[i]
+            breath.duration = durations[i]
+            breath.autoreverses = true
+            breath.repeatCount = .infinity
+            breath.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            breath.beginTime = CACurrentMediaTime() + delays[i]
+            bar.add(breath, forKey: "klaus.idle")
+        }
+        startIdleBlink()
+    }
+
+    private func startIdleBlink() {
+        stopIdleBlink()
+        scheduleNextBlink()
+    }
+
+    private func stopIdleBlink() {
+        idleBlinkTimer?.invalidate()
+        idleBlinkTimer = nil
+    }
+
+    private func scheduleNextBlink() {
+        let delay = Double.random(in: 4.0...7.0)
+        let timer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            self?.performBlink()
+        }
+        idleBlinkTimer = timer
+    }
+
+    private func performBlink() {
+        for bar in klausBars {
+            let blink = CABasicAnimation(keyPath: "transform.scale.y")
+            blink.fromValue = bar.value(forKeyPath: "transform.scale.y") ?? 1.0
+            blink.toValue = 0.08
+            blink.duration = 0.09
+            blink.autoreverses = true
+            blink.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            bar.add(blink, forKey: "klaus.blink")
+        }
+        scheduleNextBlink()
+    }
+
+    // MARK: - Recording
+
+    private func startRecordingAnimation() {
+        amplitudeHistory = Self.barBaselineScales
+        amplitudePhase = 0.0
+        let baseColor: CGColor = focusModeActive
+            ? Self.claudeOrangeBright.cgColor
+            : (invertedMode ? Self.klausDark : Self.klausCream).cgColor
+        for (i, bar) in klausBars.enumerated() {
+            bar.removeAllAnimations()
+            bar.backgroundColor = baseColor
+            bar.transform = CATransform3DMakeScale(1.0, Self.barBaselineScales[i], 1.0)
+        }
+        if focusModeActive {
+            addAntiPhaseBarPulse()
+        }
+    }
+
+    /// Bar-Color pulst orange antizyklisch zur Border (Border bright = Bars darker, und umgekehrt).
+    private func addAntiPhaseBarPulse() {
+        for bar in klausBars {
+            let pulse = CABasicAnimation(keyPath: "backgroundColor")
+            pulse.fromValue = Self.claudeOrangeBright.cgColor
+            pulse.toValue = Self.claudeOrange.cgColor
+            pulse.duration = 1.6
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            bar.add(pulse, forKey: "klaus.barpulse")
+        }
+    }
+
+    private func removeBarColorPulse() {
+        for bar in klausBars {
+            bar.removeAnimation(forKey: "klaus.barpulse")
         }
     }
 
     func resetRecordingWave() {
-        DispatchQueue.main.async {
-            self.waveSamples = Array(repeating: 0.0, count: self.recordingBars.count)
-            self.recordingLevel = 0.0
-            self.recordingPhase = 0.0
-            self.redrawWaveform()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.amplitudeHistory = Self.barBaselineScales
+            self.amplitudePhase = 0.0
+            for (i, bar) in self.klausBars.enumerated() {
+                bar.removeAllAnimations()
+                bar.transform = CATransform3DMakeScale(1.0, Self.barBaselineScales[i], 1.0)
+            }
         }
     }
+
+    // Per-bar baseline scales chosen so each bar at minimum = round dot (height = width).
+    // barWidth_svg / barHeight_svg per bar: 14/58, 14/82, 14/104, 14/82, 14/58.
+    private static let barBaselineScales: [CGFloat] = [0.241, 0.171, 0.135, 0.171, 0.241]
+    // Bar response factors — middle bar reacts strongest, edges less
+    private static let barResponseFactors: [CGFloat] = [0.85, 0.95, 1.00, 0.95, 0.85]
 
     func updateRecordingLevel(_ level: CGFloat) {
-        DispatchQueue.main.async {
-            self.recordingLevel = max(0.0, min(1.0, level))
-            guard self.waveContainer.opacity > 0.0 else { return }
-            if self.waveSamples.isEmpty {
-                self.waveSamples = Array(repeating: 0.0, count: self.recordingBars.count)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.lastAppliedState == .recording else { return }
+            if self.amplitudeHistory.count != self.klausBars.count {
+                self.amplitudeHistory = Array(repeating: 0.2, count: self.klausBars.count)
             }
-            let gated = max(0.0, (self.recordingLevel - 0.08) / 0.92)
-            let sample = gated <= 0.0 ? 0.0 : pow(gated, 1.02)
-            self.recordingPhase += 0.18 + (sample * 0.34)
+            let clamped = max(0.0, min(1.0, level))
+            // Gate Mikrofon-Rauschen → bei Stille bleibt speech = 0
+            let gated = max(0.0, (clamped - 0.06) / 0.94)
+            // Gamma-Korrektur: leise Stimmen reagieren stärker, laute peaken klar
+            let speech = pow(gated, 0.6)
 
-            let count = max(1, self.recordingBars.count - 1)
-            var nextSamples: [CGFloat] = []
-            nextSamples.reserveCapacity(self.recordingBars.count)
+            // Phase advances → leichter L→R Cascade-Effekt zwischen den Bars
+            self.amplitudePhase += 0.18
 
-            for index in self.recordingBars.indices {
-                let position = CGFloat(index) / CGFloat(count)
-                let centeredDistance = abs(position - 0.5) * 2.0
-                let envelope = pow(max(0.0, 1.0 - centeredDistance), 0.72)
-                let traveling = (sin(self.recordingPhase + (position * 8.0)) * 0.5) + 0.5
-                let secondary = (sin((self.recordingPhase * 1.7) - (position * 11.0)) * 0.5) + 0.5
-                let modulation = (traveling * 0.62) + (secondary * 0.38)
-                let target = sample <= 0.001
-                    ? 0.0
-                    : min(1.0, (sample * envelope * (0.42 + (0.92 * modulation))) + (sample * envelope * 0.08))
-                let current = index < self.waveSamples.count ? self.waveSamples[index] : 0.0
-                let response = target > current ? 0.8 : 0.34
-                nextSamples.append(current + ((target - current) * response))
+            CATransaction.begin()
+            CATransaction.setAnimationDuration(0.10)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+
+            for (i, bar) in self.klausBars.enumerated() {
+                // Phasen-Offset pro Bar: kleine L→R Welle, modulation auf der Speech-Antwort
+                let phaseOffset = CGFloat(i) * 0.45
+                let wave = 0.5 + 0.5 * sin(self.amplitudePhase + phaseOffset)
+
+                // Baseline: echter Dot pro Bar (height ≈ width)
+                let baseline = Self.barBaselineScales[i]
+                // Active boost: dominante Amplitude × Bar-Faktor × Wave-Modulation
+                let factor = Self.barResponseFactors[i]
+                let waveFactor = 0.75 + 0.45 * wave  // 0.75 - 1.20
+                let activeBoost = speech * factor * waveFactor * 1.35
+                let target = baseline + activeBoost
+
+                // Lerp: schneller Attack, etwas langsamerer Release
+                let current = self.amplitudeHistory[i]
+                let smoothed: CGFloat
+                if target > current {
+                    smoothed = current + (target - current) * 0.60
+                } else {
+                    smoothed = current + (target - current) * 0.22
+                }
+                self.amplitudeHistory[i] = smoothed
+                let final = max(baseline, min(1.55, smoothed))
+                bar.transform = CATransform3DMakeScale(1.0, final, 1.0)
             }
-            self.waveSamples = nextSamples
-            self.redrawWaveform()
+            CATransaction.commit()
         }
     }
 
-    private func redrawWaveform() {
-        let centerY = waveContainer.bounds.midY
-        guard !waveSamples.isEmpty else {
-            return
-        }
-        let maxExtra: CGFloat = 34
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.045)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
-        for (index, bar) in recordingBars.enumerated() {
-            let sample = index < waveSamples.count ? waveSamples[index] : 0.0
-            let amount = 0.5 + (maxExtra * sample)
-            let width = bar.bounds.width > 0 ? bar.bounds.width : 1.5
-            bar.frame = CGRect(x: bar.frame.origin.x, y: centerY - (amount / 2), width: width, height: amount)
-            let glow = pow(sample, 0.7)
-            bar.opacity = Float(0.04 + (0.96 * glow))
-        }
-        CATransaction.commit()
-    }
+    // MARK: - Processing (Wave-Bars-Ripple, Farbe je nach Focus-Mode)
 
     private func startProcessingAnimation() {
-        advanceProcessingDots()
-        let timer = Timer(timeInterval: 0.16, repeats: true) { [weak self] _ in
-            self?.advanceProcessingDots()
-        }
-        processingDotsTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        // Farbe: cream/dark im Normal-Mode, orange im Focus-Mode (Focus-Differenzierung)
+        let barColor: CGColor = focusModeActive
+            ? Self.claudeOrangeBright.cgColor
+            : (invertedMode ? Self.klausDark : Self.klausCream).cgColor
 
-        let shimmer = CABasicAnimation(keyPath: "opacity")
-        shimmer.fromValue = 0.94
-        shimmer.toValue = 1.0
-        shimmer.duration = 0.9
-        shimmer.autoreverses = true
-        shimmer.repeatCount = .infinity
-        shimmer.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        blurView.layer?.add(shimmer, forKey: "pill.processingShimmer")
+        for (i, bar) in klausBars.enumerated() {
+            bar.removeAllAnimations()
+            bar.backgroundColor = barColor
+            // Reset zu identity damit transform-Animation aus klarer Ausgangslage startet
+            bar.transform = CATransform3DIdentity
+
+            // Wave-Bars-Ripple: scaleY pumpt von 0.4 → 1.1 → 0.4, L→R Cascade
+            let anim = CAKeyframeAnimation(keyPath: "transform.scale.y")
+            anim.values = [0.4, 1.1, 0.4]
+            anim.keyTimes = [0.0, 0.5, 1.0]
+            anim.duration = 1.4
+            anim.repeatCount = .infinity
+            anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            anim.beginTime = CACurrentMediaTime() + Double(i) * 0.14
+            bar.add(anim, forKey: "klaus.processing")
+        }
     }
 
-    private func advanceProcessingDots() {
-        let states: [[CGFloat]] = [
-            [1.0, 0.24, 0.24],
-            [1.0, 1.0, 0.24],
-            [1.0, 1.0, 1.0],
-            [0.24, 1.0, 1.0],
-            [0.24, 0.24, 1.0],
-            [0.24, 0.24, 0.24]
-        ]
-        let state = states[processingDotsStep % states.count]
-        processingDotsStep += 1
-        CATransaction.begin()
-        CATransaction.setAnimationDuration(0.14)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-        for (index, dot) in dotLayers.enumerated() {
-            let emphasis = state[index]
-            dot.opacity = Float(emphasis)
-            let scale = 0.84 + (0.22 * emphasis)
-            let lift = -1.8 * emphasis
-            dot.transform = CATransform3DConcat(
-                CATransform3DMakeScale(scale, scale, 1.0),
-                CATransform3DMakeTranslation(0, lift, 0)
-            )
-        }
-        CATransaction.commit()
-    }
+    // MARK: - Success / Failure
 
-    private func startSymbolAnimation() {
+    private func startSuccessAnimation() {
+        // Check-Farbe je nach Focus: orange wenn Focus active, sonst cream/dark
+        klausCheckLayer.strokeColor = focusModeActive
+            ? Self.claudeOrangeBright.cgColor
+            : (invertedMode ? Self.klausDark : Self.klausCream).cgColor
+
+        let fadeOut = CABasicAnimation(keyPath: "opacity")
+        fadeOut.fromValue = 1.0
+        fadeOut.toValue = 0.0
+        fadeOut.duration = 0.18
+        fadeOut.fillMode = .forwards
+        fadeOut.isRemovedOnCompletion = false
+        for bar in klausBars { bar.add(fadeOut, forKey: "klaus.success.bars") }
+
+        let checkIn = CABasicAnimation(keyPath: "opacity")
+        checkIn.fromValue = 0.0
+        checkIn.toValue = 1.0
+        checkIn.duration = 0.22
+        checkIn.beginTime = CACurrentMediaTime() + 0.10
+        checkIn.fillMode = .forwards
+        checkIn.isRemovedOnCompletion = false
+        klausCheckLayer.add(checkIn, forKey: "klaus.success.check")
+
         let pop = CAKeyframeAnimation(keyPath: "transform.scale")
-        pop.values = [0.78, 1.08, 1.0]
-        pop.keyTimes = [0.0, 0.58, 1.0]
-        pop.duration = 0.24
-        pop.timingFunctions = [
-            CAMediaTimingFunction(name: .easeOut),
-            CAMediaTimingFunction(name: .easeOut)
-        ]
-        symbolLabel.layer?.add(pop, forKey: symbolPopKey)
+        pop.values = [0.5, 1.15, 1.0]
+        pop.keyTimes = [0.0, 0.6, 1.0]
+        pop.duration = 0.30
+        pop.beginTime = CACurrentMediaTime() + 0.10
+        pop.fillMode = .forwards
+        pop.isRemovedOnCompletion = false
+        klausCheckLayer.add(pop, forKey: "klaus.success.pop")
+    }
 
-        let flash = CABasicAnimation(keyPath: "opacity")
-        flash.fromValue = 0.75
-        flash.toValue = 1.0
-        flash.duration = 0.18
-        flash.autoreverses = true
-        flash.repeatCount = 1
-        blurView.layer?.add(flash, forKey: "pill.flash")
+    private func startFailureAnimation() {
+        // X-Farbe je nach Focus: orange wenn Focus active, sonst cream/dark
+        klausXLayer.strokeColor = focusModeActive
+            ? Self.claudeOrangeBright.cgColor
+            : (invertedMode ? Self.klausDark : Self.klausCream).cgColor
+
+        let fadeOut = CABasicAnimation(keyPath: "opacity")
+        fadeOut.fromValue = 1.0
+        fadeOut.toValue = 0.0
+        fadeOut.duration = 0.18
+        fadeOut.fillMode = .forwards
+        fadeOut.isRemovedOnCompletion = false
+        for bar in klausBars { bar.add(fadeOut, forKey: "klaus.failure.bars") }
+
+        let xIn = CABasicAnimation(keyPath: "opacity")
+        xIn.fromValue = 0.0
+        xIn.toValue = 1.0
+        xIn.duration = 0.22
+        xIn.beginTime = CACurrentMediaTime() + 0.10
+        xIn.fillMode = .forwards
+        xIn.isRemovedOnCompletion = false
+        klausXLayer.add(xIn, forKey: "klaus.failure.x")
+
+        let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+        pop.values = [0.5, 1.15, 1.0]
+        pop.keyTimes = [0.0, 0.6, 1.0]
+        pop.duration = 0.30
+        pop.beginTime = CACurrentMediaTime() + 0.10
+        pop.fillMode = .forwards
+        pop.isRemovedOnCompletion = false
+        klausXLayer.add(pop, forKey: "klaus.failure.pop")
+    }
+
+    // MARK: - Public setters
+
+    func setFocusMode(_ active: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Focus-Visual hält durch die gesamte Session (recording → processing → success/failure → hide).
+            // setFocusMode(false) während eines aktiven States wird ignoriert — Reset passiert in hideImmediately().
+            if !active && self.lastAppliedState != .hidden {
+                return
+            }
+            self.focusModeActive = active
+            // Border je nach Mode + State neu anwenden
+            switch self.lastAppliedState {
+            case .recording, .processing:
+                self.applyActiveBorderForCurrentMode()
+            case .success, .failure:
+                self.applySuccessFailureBorder()
+            case .hidden:
+                self.applyIdleBorder()
+            }
+            // Bar-Color umstellen, wenn Recording läuft
+            if self.lastAppliedState == .recording {
+                self.removeBarColorPulse()
+                let baseColor: CGColor = active
+                    ? Self.claudeOrangeBright.cgColor
+                    : (self.invertedMode ? Self.klausDark : Self.klausCream).cgColor
+                for bar in self.klausBars { bar.backgroundColor = baseColor }
+                if active { self.addAntiPhaseBarPulse() }
+            }
+            self.updateChipContent()
+        }
+    }
+
+    func setRecordingTime(_ seconds: Double) {
+        let total = max(0, Int(seconds))
+        let m = total / 60
+        let s = total % 60
+        let text = String(format: "%d:%02d", m, s)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard text != self.recordingTimeText else { return }
+            self.recordingTimeText = text
+            self.updateChipContent()
+        }
+    }
+
+    func resetRecordingTime() {
+        DispatchQueue.main.async { [weak self] in
+            self?.recordingTimeText = ""
+            self?.updateChipContent()
+        }
+    }
+
+    func setPaneTarget(_ index: Int?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.activePaneIndex = index
+            self.updateChipContent()
+        }
+    }
+
+    private func updateChipContent() {
+        let attr = NSMutableAttributedString()
+        var hasContent = false
+
+        // Pane-Mode: nur die Zahl, kein ⌘-Präfix.
+        // Focus-Mode: keine Pane-Anzeige — Differenzierung erfolgt über orange Bars.
+        if !focusModeActive, let pane = activePaneIndex, (1...4).contains(pane) {
+            attr.append(NSAttributedString(string: "\(pane)", attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: Self.claudeOrange
+            ]))
+            hasContent = true
+        }
+
+        if lastAppliedState == .recording, !recordingTimeText.isEmpty {
+            if hasContent {
+                attr.append(NSAttributedString(string: "  ", attributes: [
+                    .font: NSFont.systemFont(ofSize: 13)
+                ]))
+            }
+            attr.append(NSAttributedString(string: recordingTimeText, attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: NSColor.white.withAlphaComponent(0.95)
+            ]))
+            hasContent = true
+        }
+
+        guard hasContent else {
+            chipBackground.isHidden = true
+            return
+        }
+        chipBackground.isHidden = false
+        chipLabel.attributedStringValue = attr
+        chipLabel.sizeToFit()
+        let labelSize = chipLabel.frame.size
+        let chipWidth = ceil(labelSize.width) + 18
+        chipBackground.frame = NSRect(
+            x: (Self.windowWidth - chipWidth) / 2,
+            y: 0,
+            width: chipWidth,
+            height: Self.chipHeight
+        )
+        // Chip-Border bleibt subtil in beiden Modi — Differenzierung über Bars-Farbe.
+        chipBackground.layer?.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        chipBackground.layer?.borderWidth = 0.5
+        chipLabel.frame = NSRect(
+            x: 9,
+            y: (Self.chipHeight - labelSize.height) / 2,
+            width: labelSize.width,
+            height: labelSize.height
+        )
     }
 }
 
 final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let pill = FlowPillController()
-    private let successSoundNames = ["Tink", "Glass", "Funk", "Pop"]
+    private let successSoundNames = ["Standard"]
+    private let wowSoundFiles: [String: String] = [
+        "Standard": "sounds/wow-whisper.m4a"
+    ]
     private let fillerWords = ["äh", "ähm", "ähhh", "ähhhm", "hm", "hmm", "hmmm", "mhm", "mmh", "mmhm", "uh", "uhm", "um"]
     private let knownHallucinationPhrases = [
         "vielen dank furs zuschauen",
@@ -567,19 +849,19 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let releaseGraceInterval: TimeInterval = 0.08
     private let localPasteDispatchDelayNs: UInt64 = 50_000_000
     private let localPasteSendDelayNs: UInt64 = 250_000_000
-    private let fallbackHotKeySignature: OSType = 0x4b465057
 
     private var statusItem: NSStatusItem?
     private var modeItems: [OutputMode: NSMenuItem] = [:]
-    private var soundItems: [String: NSMenuItem] = [:]
     private var volumeValueItem: NSMenuItem?
     private var polishMenuItem: NSMenuItem?
     private var translateMenuItem: NSMenuItem?
     private var pauseMenuItem: NSMenuItem?
-    private var roleplayMenuItem: NSMenuItem?
     private var emojiMenuItem: NSMenuItem?
-    private var customPromptMenuItem: NSMenuItem?
     private var autoDetectMenuItem: NSMenuItem?
+    private var soundEnabledMenuItem: NSMenuItem?
+    private var autostartMenuItem: NSMenuItem?
+    private var invertedMenuItem: NSMenuItem?
+    private var settingsWindowController: SettingsWindowController?
     private var historyMenu: NSMenu?
     private var transcriptionHistory: [TranscriptionEntry] = []
     private let historyCapacity = 10
@@ -592,11 +874,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isRecording = false
     private var isProcessing = false
     private var rightCommandDown = false
-    private var leftCommandDown = false
-    private var fallbackHotkeyDown = false
     private var pttDown = false
     private var cancelledWhileHeld = false
-    private var leftCommandLocked = false
     private var accessibilityPrompted = false
     private var pendingStopWorkItem: DispatchWorkItem?
     private var recordingStartedAt = Date.distantPast
@@ -608,15 +887,17 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var currentProcessingTask: Task<Void, Never>?
     private var hotkeyPollTimer: Timer?
     private var recordingMeterTimer: Timer?
-    private var fallbackHotKeyRef: EventHotKeyRef?
-    private var fallbackHotKeyHandler: EventHandlerRef?
-    private let allowEitherCommand = false
+    private var globalEventHandler: EventHandlerRef?
 
     // MARK: - Pane PTT (Cmd+Shift+1..4 → POST transcript to remote pane composer)
     fileprivate let paneHotKeySignature: OSType = 0x504e504b   // 'PNPK'
     private var paneHotKeyRefs: [EventHotKeyRef?] = [nil, nil, nil, nil]
+    private var paneArrowEventTap: CFMachPort?
+    private var paneArrowRunLoopSource: CFRunLoopSource?
     fileprivate var paneHotKeyDown: [Bool] = [false, false, false, false]
     private var previousPaneHotKeyDown: [Bool] = [false, false, false, false]
+    private var lastPanePressAt: [Date] = Array(repeating: .distantPast, count: 4)
+    private let paneDebounceInterval: TimeInterval = 0.08  // filters BT-pad switch chatter (MK424BT)
     private var activePanePttIndex: Int? = nil
 
     private enum PaneDeliveryTarget {
@@ -695,16 +976,6 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private var roleplayEnabled: Bool {
-        get {
-            return UserDefaults.standard.bool(forKey: "KlausFlowRoleplayEnabled")
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "KlausFlowRoleplayEnabled")
-            refreshMenu()
-        }
-    }
-
     private var emojiEnabled: Bool {
         get {
             return UserDefaults.standard.bool(forKey: "KlausFlowEmojiEnabled")
@@ -712,25 +983,6 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set {
             UserDefaults.standard.set(newValue, forKey: "KlausFlowEmojiEnabled")
             refreshMenu()
-        }
-    }
-
-    private var customPromptEnabled: Bool {
-        get {
-            return UserDefaults.standard.bool(forKey: "KlausFlowCustomPromptEnabled")
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "KlausFlowCustomPromptEnabled")
-            refreshMenu()
-        }
-    }
-
-    private var customPromptText: String {
-        get {
-            return UserDefaults.standard.string(forKey: "KlausFlowCustomPromptText")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: "KlausFlowCustomPromptText")
         }
     }
 
@@ -758,7 +1010,38 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private var polishModel: String {
+    private var launchAgentPlistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/ai.denzer.klaus.plist")
+    }
+
+    private var autostartEnabled: Bool {
+        get {
+            guard let data = try? Data(contentsOf: launchAgentPlistURL),
+                  let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+                return false
+            }
+            return (dict["RunAtLoad"] as? Bool) ?? false
+        }
+        set {
+            guard let data = try? Data(contentsOf: launchAgentPlistURL),
+                  var dict = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] else {
+                logLine("FLOW autostart_set failed_to_read_plist")
+                return
+            }
+            dict["RunAtLoad"] = newValue
+            do {
+                let outData = try PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+                try outData.write(to: launchAgentPlistURL)
+                logLine("FLOW autostart_set value=\(newValue)")
+            } catch {
+                logLine("FLOW autostart_set failed=\(error.localizedDescription)")
+            }
+            refreshMenu()
+        }
+    }
+
+    fileprivate var polishModel: String {
         get {
             let defaults = UserDefaults.standard.string(forKey: "KlausFlowPolishModel")?.trimmingCharacters(in: .whitespacesAndNewlines)
             return defaults?.isEmpty == false ? defaults! : "llama-3.3-70b-versatile"
@@ -771,11 +1054,33 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var successSoundName: String {
         get {
             let stored = UserDefaults.standard.string(forKey: "KlausFlowSoundName")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return successSoundNames.contains(stored) ? stored : "Tink"
+            return successSoundNames.contains(stored) ? stored : "Standard"
         }
         set {
-            let name = successSoundNames.contains(newValue) ? newValue : "Tink"
+            let name = successSoundNames.contains(newValue) ? newValue : "Standard"
             UserDefaults.standard.set(name, forKey: "KlausFlowSoundName")
+            refreshMenu()
+        }
+    }
+
+    private var soundEnabled: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: "KlausFlowSoundEnabled") == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: "KlausFlowSoundEnabled")
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "KlausFlowSoundEnabled")
+            refreshMenu()
+        }
+    }
+
+    private var invertedMode: Bool {
+        get { UserDefaults.standard.bool(forKey: "KlausFlowInverted") }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "KlausFlowInverted")
+            pill.setInverted(newValue)
             refreshMenu()
         }
     }
@@ -791,7 +1096,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private var groqAPIKey: String {
+    fileprivate var groqAPIKey: String {
         get {
             let defaults = UserDefaults.standard.string(forKey: "KlausFlowGroqAPIKey")?.trimmingCharacters(in: .whitespacesAndNewlines)
             let env = ProcessInfo.processInfo.environment["GROQ_API_KEY"]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -814,12 +1119,12 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private lazy var urlSession: URLSession = {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 25
-        config.timeoutIntervalForResource = 60
+        config.timeoutIntervalForRequest = 90
+        config.timeoutIntervalForResource = 180
         return URLSession(configuration: config)
     }()
 
-    private var flowHomeURL: URL {
+    fileprivate var flowHomeURL: URL {
         URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".klaus-flow", isDirectory: true)
     }
 
@@ -856,12 +1161,39 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func run() {
+        migrateOldDefaultsIfNeeded()
         ensureDictionaryFileExists()
         loadHistory()
         requestPermissions()
         setupStatusBar()
         setupHotkeys()
-        print("Klaus Flow ready: hold RIGHT COMMAND or CTRL+SHIFT+SPACE to transcribe")
+        print("Klaus ready: hold RIGHT COMMAND to transcribe")
+    }
+
+    private func migrateOldDefaultsIfNeeded() {
+        let migrationFlag = "KlausDefaultsMigratedFromOpenClaw"
+        if UserDefaults.standard.bool(forKey: migrationFlag) { return }
+        guard let old = UserDefaults(suiteName: "com.openclaw.klaus-flow") else {
+            UserDefaults.standard.set(true, forKey: migrationFlag)
+            return
+        }
+        let keys = [
+            "KlausFlowOutputMode", "KlausFlowPillFollowsMouse", "KlausFlowCleanTextEnabled",
+            "KlausFlowPolishEnabled", "KlausFlowTranslateEnabled", "KlausFlowEmojiEnabled",
+            "KlausFlowAutoDetectLanguage", "KlausFlowPaused", "KlausFlowPolishModel",
+            "KlausFlowSoundName", "KlausFlowSoundVolume", "KlausFlowSoundEnabled",
+            "KlausFlowGroqAPIKey", "KlausFlowGroqModel", "KlausFlowPaneEndpoint",
+            "KlausFlowPaneToken", "KlausFlowHistory"
+        ]
+        var migrated = 0
+        for key in keys {
+            if let value = old.object(forKey: key), UserDefaults.standard.object(forKey: key) == nil {
+                UserDefaults.standard.set(value, forKey: key)
+                migrated += 1
+            }
+        }
+        UserDefaults.standard.set(true, forKey: migrationFlag)
+        logLine("FLOW defaults_migrated count=\(migrated) from=com.openclaw.klaus-flow")
     }
 
     private func setupStatusBar() {
@@ -870,15 +1202,19 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem?.button?.image = icon
         statusItem?.button?.imagePosition = .imageOnly
         statusItem?.button?.imageScaling = .scaleProportionallyUpOrDown
-        statusItem?.button?.toolTip = "Klaus Flow"
+        statusItem?.button?.toolTip = "Klaus"
 
         let menu = NSMenu()
         menu.delegate = self
 
-        let modeTitle = NSMenuItem(title: "Aktion", action: nil, keyEquivalent: "")
-        modeTitle.isEnabled = false
-        menu.addItem(modeTitle)
+        // Hotkey-Hint
+        let hint = NSMenuItem(title: "PTT: ⌘ rechts halten", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
 
+        menu.addItem(NSMenuItem.separator())
+
+        // Output-Modus
         for mode in [OutputMode.paste, .pasteSend] {
             let item = NSMenuItem(title: mode.title, action: #selector(selectMode(_:)), keyEquivalent: "")
             item.target = self
@@ -889,11 +1225,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let dictionaryItem = NSMenuItem(title: "Wörterbuch öffnen…", action: #selector(openDictionary(_:)), keyEquivalent: "")
-        dictionaryItem.target = self
-        menu.addItem(dictionaryItem)
-
-        let polishItem = NSMenuItem(title: "Grammatik", action: #selector(togglePolish(_:)), keyEquivalent: "")
+        // Text-Tweaks
+        let polishItem = NSMenuItem(title: "Text polieren", action: #selector(togglePolish(_:)), keyEquivalent: "")
         polishItem.target = self
         polishItem.state = polishEnabled ? .on : .off
         polishMenuItem = polishItem
@@ -905,23 +1238,11 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         translateMenuItem = translateItem
         menu.addItem(translateItem)
 
-        let roleplayItem = NSMenuItem(title: "Roleplay: Altdeutsch", action: #selector(toggleRoleplay(_:)), keyEquivalent: "")
-        roleplayItem.target = self
-        roleplayItem.state = roleplayEnabled ? .on : .off
-        roleplayMenuItem = roleplayItem
-        menu.addItem(roleplayItem)
-
         let emojiItem = NSMenuItem(title: "Emoji-Modus", action: #selector(toggleEmoji(_:)), keyEquivalent: "")
         emojiItem.target = self
         emojiItem.state = emojiEnabled ? .on : .off
         emojiMenuItem = emojiItem
         menu.addItem(emojiItem)
-
-        let customItem = NSMenuItem(title: "Custom Prompt…", action: #selector(configureCustomPrompt(_:)), keyEquivalent: "")
-        customItem.target = self
-        customItem.state = customPromptEnabled ? .on : .off
-        customPromptMenuItem = customItem
-        menu.addItem(customItem)
 
         let autoDetectItem = NSMenuItem(title: "Sprache auto-erkennen", action: #selector(toggleAutoDetect(_:)), keyEquivalent: "")
         autoDetectItem.target = self
@@ -931,6 +1252,34 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Bestätigungston (Toggle + Volume)
+        let soundToggle = NSMenuItem(title: "Bestätigungston", action: #selector(toggleSoundEnabled(_:)), keyEquivalent: "")
+        soundToggle.target = self
+        soundToggle.state = soundEnabled ? .on : .off
+        soundEnabledMenuItem = soundToggle
+        menu.addItem(soundToggle)
+
+        let volumeLabel = NSMenuItem(title: soundVolumeLabel(), action: nil, keyEquivalent: "")
+        volumeLabel.isEnabled = false
+        volumeValueItem = volumeLabel
+        menu.addItem(volumeLabel)
+
+        let slider = NSSlider(value: successSoundVolume, minValue: 0.0, maxValue: 1.0, target: self, action: #selector(soundVolumeChanged(_:)))
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 28))
+        wrapper.addSubview(slider)
+        NSLayoutConstraint.activate([
+            slider.centerXAnchor.constraint(equalTo: wrapper.centerXAnchor),
+            slider.centerYAnchor.constraint(equalTo: wrapper.centerYAnchor),
+            slider.widthAnchor.constraint(equalToConstant: 200)
+        ])
+        let sliderItem = NSMenuItem()
+        sliderItem.view = wrapper
+        menu.addItem(sliderItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // History
         let historyItem = NSMenuItem(title: "Letzte Transkriptionen", action: nil, keyEquivalent: "")
         let hMenu = NSMenu()
         historyMenu = hMenu
@@ -940,53 +1289,39 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        let toneItem = NSMenuItem(title: "Klang", action: nil, keyEquivalent: "")
-        let toneMenu = NSMenu()
-        for name in successSoundNames {
-            let item = NSMenuItem(title: name, action: #selector(selectSound(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = name
-            soundItems[name] = item
-            toneMenu.addItem(item)
-        }
-        menu.setSubmenu(toneMenu, for: toneItem)
-        menu.addItem(toneItem)
-
-        let volumeLabel = NSMenuItem(title: soundVolumeLabel(), action: nil, keyEquivalent: "")
-        volumeLabel.isEnabled = false
-        volumeValueItem = volumeLabel
-        menu.addItem(volumeLabel)
-
-        let slider = NSSlider(value: successSoundVolume, minValue: 0.0, maxValue: 1.0, target: self, action: #selector(soundVolumeChanged(_:)))
-        slider.frame = NSRect(x: 0, y: 0, width: 180, height: 24)
-        let sliderItem = NSMenuItem()
-        let wrapper = NSView(frame: NSRect(x: 0, y: 0, width: 200, height: 28))
-        slider.frame.origin = NSPoint(x: 10, y: 2)
-        wrapper.addSubview(slider)
-        sliderItem.view = wrapper
-        menu.addItem(sliderItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let permissionsItem = NSMenuItem(title: "Rechte prüfen", action: #selector(checkPermissions(_:)), keyEquivalent: "")
-        permissionsItem.target = self
-        menu.addItem(permissionsItem)
-
-        let logsItem = NSMenuItem(title: "Logs öffnen…", action: #selector(openLogs(_:)), keyEquivalent: "")
-        logsItem.target = self
-        menu.addItem(logsItem)
-
-        let keyItem = NSMenuItem(title: "Groq-Schlüssel…", action: #selector(configureGroqKey(_:)), keyEquivalent: "")
-        keyItem.target = self
-        menu.addItem(keyItem)
-
-        menu.addItem(NSMenuItem.separator())
-
-        let pauseItem = NSMenuItem(title: "Pausieren", action: #selector(togglePause(_:)), keyEquivalent: "")
+        // PTT deaktivieren
+        let pauseItem = NSMenuItem(title: "PTT deaktivieren", action: #selector(togglePause(_:)), keyEquivalent: "")
         pauseItem.target = self
         pauseItem.state = paused ? .on : .off
         pauseMenuItem = pauseItem
         menu.addItem(pauseItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Autostart beim Login
+        let autostartItem = NSMenuItem(title: "Autostart beim Login", action: #selector(toggleAutostart(_:)), keyEquivalent: "")
+        autostartItem.target = self
+        autostartItem.state = autostartEnabled ? .on : .off
+        autostartMenuItem = autostartItem
+        menu.addItem(autostartItem)
+
+        // Invertiertes Klaus-Design
+        let invertedItem = NSMenuItem(title: "Klaus invertiert (hell)", action: #selector(toggleInverted(_:)), keyEquivalent: "")
+        invertedItem.target = self
+        invertedItem.state = invertedMode ? .on : .off
+        invertedMenuItem = invertedItem
+        menu.addItem(invertedItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Einstellungen / Über / Beenden
+        let settingsItem = NSMenuItem(title: "Einstellungen…", action: #selector(openSettings(_:)), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
+        let aboutItem = NSMenuItem(title: "Über Klaus", action: #selector(showAbout(_:)), keyEquivalent: "")
+        aboutItem.target = self
+        menu.addItem(aboutItem)
 
         let quitItem = NSMenuItem(title: "Beenden", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
@@ -997,6 +1332,12 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func makeStatusBarIcon() -> NSImage {
+        if let url = Bundle.main.url(forResource: "klaus", withExtension: "svg"),
+           let image = NSImage(contentsOf: url) {
+            let targetHeight: CGFloat = 18.0
+            image.size = NSSize(width: targetHeight, height: targetHeight)
+            return image
+        }
         let iconPath = flowHomeURL.appendingPathComponent("klaus-flow-icon.png")
         if let image = NSImage(contentsOf: iconPath) {
             let targetHeight: CGFloat = 18.0
@@ -1073,11 +1414,12 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         hotkeyPollTimer = timer
         RunLoop.main.add(timer, forMode: .common)
-        setupFallbackHotkey()
+        setupGlobalEventHandler()
         setupPaneHotkeys()
+        setupPaneArrowEventTap()
     }
 
-    private func setupFallbackHotkey() {
+    private func setupGlobalEventHandler() {
         let eventTypes = [
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
             EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
@@ -1100,12 +1442,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
             let sig = hotKeyID.signature
             let id = hotKeyID.id
-            if sig == app.fallbackHotKeySignature {
-                DispatchQueue.main.async {
-                    app.fallbackHotkeyDown = pressed
-                    app.syncHotkeyState()
-                }
-            } else if sig == app.paneHotKeySignature {
+            if sig == app.paneHotKeySignature {
                 let idx = Int(id) - 10
                 if idx >= 0 && idx < 4 {
                     DispatchQueue.main.async {
@@ -1118,11 +1455,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        InstallEventHandler(GetApplicationEventTarget(), handler, eventTypes.count, eventTypes, userData, &fallbackHotKeyHandler)
-
-        let hotKeyID = EventHotKeyID(signature: fallbackHotKeySignature, id: 1)
-        let modifiers = UInt32(controlKey | shiftKey)
-        RegisterEventHotKey(UInt32(kVK_Space), modifiers, hotKeyID, GetApplicationEventTarget(), 0, &fallbackHotKeyRef)
+        InstallEventHandler(GetApplicationEventTarget(), handler, eventTypes.count, eventTypes, userData, &globalEventHandler)
     }
 
     private var escapeWasDown = false
@@ -1181,23 +1514,20 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handleFlagsChanged(_ event: NSEvent) {
-        guard event.keyCode == 54 || event.keyCode == 55 else { return }
+        guard event.keyCode == 54 else { return }
         let rawFlags = event.modifierFlags.rawValue
         rightCommandDown = (rawFlags & nxDeviceRCmdKeyMask) != 0
-        leftCommandDown = (rawFlags & nxDeviceLCmdKeyMask) != 0
-        leftCommandLocked = leftCommandDown && !rightCommandDown && !allowEitherCommand
         syncHotkeyState()
     }
 
     private func syncHotkeyState() {
-        let rawPressed = fallbackHotkeyDown || rightCommandDown || (allowEitherCommand && leftCommandDown)
         // First-pressed wins: while pane PTT is busy, don't activate regular PTT.
         // Releases (transitions false) are always honored so we don't get stuck.
         let paneBusy = activePanePttIndex != nil || isRecordingPane || isProcessingPane
-        let pressed = rawPressed && !(paneBusy && !pttDown)
+        let pressed = rightCommandDown && !(paneBusy && !pttDown)
         guard pressed != pttDown else { return }
         pttDown = pressed
-        logLine("FLOW ptt_state pressed=\(pressed) rightCommand=\(rightCommandDown) leftCommand=\(leftCommandDown) fallback=\(fallbackHotkeyDown) paneBusy=\(paneBusy)")
+        logLine("FLOW ptt_state pressed=\(pressed) rightCommand=\(rightCommandDown) paneBusy=\(paneBusy)")
         if pressed {
             sendStopAudioFireAndForget()
         }
@@ -1255,7 +1585,10 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 recordingMaxLevel = 0.0
                 logLine("FLOW recording_started path=\(tmp.path)")
                 pill.resetRecordingWave()
+                pill.resetRecordingTime()
+                pill.setPaneTarget(nil)
                 pill.show(state: .recording, mode: outputMode)
+                pill.setFocusMode(true)
                 startRecordingMeterUpdates()
                 return
             } catch {
@@ -1273,7 +1606,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         print("FLOW recording_failed \(lastError?.localizedDescription ?? "unknown")")
-        pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+        pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
     }
 
     private func stopRecordingIfNeeded() {
@@ -1281,6 +1614,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pendingStopWorkItem?.cancel()
         pendingStopWorkItem = nil
         isRecording = false
+        pill.setFocusMode(false)
 
         stopRecordingMeterUpdates()
         audioRecorder?.stop()
@@ -1290,7 +1624,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logLine("FLOW recording_stopped duration=\(String(format: "%.2f", duration)) pttDown=\(pttDown)")
 
         guard let url = audioURL else {
-            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
             return
         }
 
@@ -1300,7 +1634,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? FileManager.default.removeItem(at: url)
             audioURL = nil
             recordingMaxLevel = 0.0
-            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
             return
         }
         recordingMaxLevel = 0.0
@@ -1326,6 +1660,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isRecording = false
         pttDown = false
         cancelledWhileHeld = true
+        pill.setFocusMode(false)
 
         stopRecordingMeterUpdates()
         audioRecorder?.stop()
@@ -1337,7 +1672,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recordingStartedAt = Date.distantPast
         recordingMaxLevel = 0.0
 
-        pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+        pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
     }
 
     private func startRecordingMeterUpdates() {
@@ -1354,6 +1689,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.recordingMaxLevel = peak
             }
             self.pill.updateRecordingLevel(level)
+            self.pill.setRecordingTime(Date().timeIntervalSince(self.recordingStartedAt))
         }
         recordingMeterTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -1384,7 +1720,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             logLine("FLOW transcript_raw \(trimmed)")
             logLine("FLOW transcript_final \(cleaned)")
             guard !cleaned.isEmpty else {
-                await showPill(.failure, autoHideAfter: 1.2)
+                await showPill(.failure, autoHideAfter: 0.8)
                 return
             }
             var finalText = cleaned
@@ -1408,27 +1744,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     logLine("FLOW translate_error \(error.localizedDescription)")
                 }
             }
-            if roleplayEnabled {
-                do {
-                    logLine("FLOW roleplay_before \(finalText)")
-                    let medieval = try await roleplayAltdeutsch(finalText)
-                    logLine("FLOW roleplay_after \(medieval)")
-                    finalText = medieval
-                } catch {
-                    logLine("FLOW roleplay_error \(error.localizedDescription)")
-                }
-            }
-            if customPromptEnabled && !customPromptText.isEmpty {
-                do {
-                    logLine("FLOW custom_prompt_before \(finalText)")
-                    let custom = try await applyCustomPrompt(finalText)
-                    logLine("FLOW custom_prompt_after \(custom)")
-                    finalText = custom
-                } catch {
-                    logLine("FLOW custom_prompt_error \(error.localizedDescription)")
-                }
-            }
-            if emojiEnabled {
+            if emojiEnabled, shouldRollEmojis(for: finalText) {
                 do {
                     logLine("FLOW emoji_before \(finalText)")
                     let withEmoji = try await addEmojis(finalText)
@@ -1437,27 +1753,21 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 } catch {
                     logLine("FLOW emoji_error \(error.localizedDescription)")
                 }
+            } else if emojiEnabled {
+                logLine("FLOW emoji_skip \(finalText)")
             }
             guard !finalText.isEmpty else {
-                await showPill(.failure, autoHideAfter: 1.2)
+                await showPill(.failure, autoHideAfter: 0.8)
                 return
             }
 
             addToHistory(finalText)
 
-            // Klaus Bot integration: if WoW is active AND bot is running, send as command
-            if isFrontmostAppWoW(), await sendToKlausBotIfRunning(finalText) {
-                logLine("FLOW sent_to_klaus_bot \(finalText)")
-                playSuccessSound()
-                await showPill(.success, autoHideAfter: 1.0)
-                return
-            }
-
             let pb = NSPasteboard.general
             pb.clearContents()
             let copied = pb.setString(finalText, forType: .string)
             guard copied else {
-                await showPill(.failure, autoHideAfter: 1.2)
+                await showPill(.failure, autoHideAfter: 0.8)
                 return
             }
 
@@ -1477,13 +1787,13 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 completed = action.pasted && action.sent
             }
             guard completed else {
-                await showPill(.failure, autoHideAfter: 1.2)
+                await showPill(.failure, autoHideAfter: 0.8)
                 return
             }
             await showPill(.success, autoHideAfter: 1.0)
         } catch {
             logLine("FLOW process_error \(error.localizedDescription)")
-            await showPill(.failure, autoHideAfter: 1.2)
+            await showPill(.failure, autoHideAfter: 0.8)
         }
     }
 
@@ -1658,54 +1968,93 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return translated.isEmpty ? text : translated
     }
 
-    private func roleplayAltdeutsch(_ text: String) async throws -> String {
-        let apiKey = groqAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else { return text }
-
-        let systemPrompt = """
-            Formuliere den Text in Altdeutsch um. Kurz und knapp — gleiche Länge wie das Original.
-            - "Ihr/Euch" statt "du/dich", mittelalterliches Vokabular.
-            - KEINE zusätzlichen Wörter, Sätze oder Ausschmückungen hinzufügen.
-            - Gleiche Anzahl Sätze wie im Original.
-            - Eigennamen und Fachbegriffe beibehalten.
-            - Nur den umgewandelten Text ausgeben.
-            """
-
-        let payload: [String: Any] = [
-            "model": polishModel,
-            "temperature": 0.7,
-            "max_tokens": 2048,
-            "messages": [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": text]
-            ]
+    private static let allowedEmojiScalars: Set<UInt32> = {
+        var set = Set<UInt32>()
+        // Emoticons block — gelbe Gesichter + 🙈🙉🙊 + 🙌🙏
+        for v in 0x1F600...0x1F64F { set.insert(UInt32(v)) }
+        // Aus Block raus: Teufel (lila), Katzen (Tiere), Personen-Gesten (Ganzfigur)
+        let blockExclusions: [UInt32] = [
+            0x1F608,                                                       // 😈 Teufel
+            0x1F638, 0x1F639, 0x1F63A, 0x1F63B, 0x1F63C,                   // 😸😹😺😻😼
+            0x1F63D, 0x1F63E, 0x1F63F, 0x1F640,                            // 😽😾😿🙀
+            0x1F645, 0x1F646, 0x1F647,                                     // 🙅🙆🙇 Personen
+            0x1F64B, 0x1F64D, 0x1F64E                                      // 🙋🙍🙎 Personen
         ]
+        blockExclusions.forEach { set.remove($0) }
+        // Zusätzliche gelbe Gesichts-Emojis (🤡 ausgeschlossen — nicht gelb)
+        let faceExtras: [UInt32] = [
+            0x1F910, 0x1F911, 0x1F912, 0x1F913, 0x1F914, 0x1F915, 0x1F917,
+            0x1F920,         0x1F922, 0x1F923, 0x1F924, 0x1F925, 0x1F927,
+            0x1F928, 0x1F929, 0x1F92A, 0x1F92B, 0x1F92C, 0x1F92D, 0x1F92E, 0x1F92F,
+            0x1F970, 0x1F971, 0x1F972, 0x1F973, 0x1F974, 0x1F975, 0x1F976,
+            0x1F978, 0x1F979, 0x1F97A,
+            0x1F9D0,                                                       // 🧐 monocle
+            0x1FAE0, 0x1FAE1, 0x1FAE2, 0x1FAE3, 0x1FAE4, 0x1FAE5, 0x1FAE6, 0x1FAE8
+        ]
+        faceExtras.forEach { set.insert($0) }
+        // Hand-Emojis (inkl. 💪 Bizeps)
+        let handExtras: [UInt32] = [
+            0x1F446, 0x1F447, 0x1F448, 0x1F449, 0x1F44A, 0x1F44B, 0x1F44C,
+            0x1F44D, 0x1F44E, 0x1F44F, 0x1F450,
+            0x1F4AA,                                                       // 💪 Bizeps
+            0x1F590, 0x1F595, 0x1F596,
+            0x1F90C, 0x1F90F, 0x1F918, 0x1F919, 0x1F91A, 0x1F91B, 0x1F91C,
+            0x1F91D, 0x1F91E, 0x1F91F, 0x1F932,
+            0x1FAF0, 0x1FAF1, 0x1FAF2, 0x1FAF3, 0x1FAF4, 0x1FAF5, 0x1FAF6, 0x1FAF7, 0x1FAF8,
+            0x261D, 0x270A, 0x270B, 0x270C, 0x270D
+        ]
+        handExtras.forEach { set.insert($0) }
+        // Erlaubte Symbole
+        let symbols: [UInt32] = [
+            0x2764,    // ❤ red heart
+            0x2705,    // ✅ green check
+            0x1F494,   // 💔 broken heart
+            0x1F4AF,   // 💯 hundred
+            0x1F525    // 🔥 fire
+        ]
+        symbols.forEach { set.insert($0) }
+        return set
+    }()
 
-        let body = try JSONSerialization.data(withJSONObject: payload)
+    private static let emojiModifierScalars: Set<UInt32> = {
+        var set = Set<UInt32>()
+        for v in 0x1F3FB...0x1F3FF { set.insert(UInt32(v)) } // Skin-Tones
+        set.insert(0xFE0F) // Variation Selector-16
+        set.insert(0xFE0E) // Variation Selector-15
+        set.insert(0x200D) // Zero-Width Joiner
+        return set
+    }()
 
-        var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-        request.timeoutInterval = 10
+    private func shouldRollEmojis(for text: String) -> Bool {
+        let words = text.split(whereSeparator: { $0.isWhitespace })
+        guard words.count > 2 else { return false }
+        return Double.random(in: 0..<1) < 0.33
+    }
 
-        let (responseData, response) = try await urlSession.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let errText = String(data: responseData, encoding: .utf8) ?? ""
-            throw NSError(domain: "flow", code: 30, userInfo: [NSLocalizedDescriptionKey: "Groq roleplay fehlgeschlagen: \(errText)"])
+    private func stripDisallowedEmojis(_ text: String) -> String {
+        var result = ""
+        for cluster in text {
+            let scalars = cluster.unicodeScalars
+            let isEmojiCluster = scalars.contains { $0.properties.isEmojiPresentation || ($0.properties.isEmoji && $0.value > 0x2700) }
+            if !isEmojiCluster {
+                result.append(cluster)
+                continue
+            }
+            let allAllowed = scalars.allSatisfy { scalar in
+                let v = scalar.value
+                return Self.allowedEmojiScalars.contains(v) || Self.emojiModifierScalars.contains(v)
+            }
+            if allAllowed {
+                result.append(cluster)
+            }
         }
-
-        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw NSError(domain: "flow", code: 31, userInfo: [NSLocalizedDescriptionKey: "Groq roleplay: Antwort ohne content"])
+        while result.contains("  ") {
+            result = result.replacingOccurrences(of: "  ", with: " ")
         }
-
-        let result = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? text : result
+        return result.replacingOccurrences(of: " .", with: ".")
+                     .replacingOccurrences(of: " ,", with: ",")
+                     .replacingOccurrences(of: " !", with: "!")
+                     .replacingOccurrences(of: " ?", with: "?")
     }
 
     private func addEmojis(_ text: String) async throws -> String {
@@ -1714,8 +2063,14 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let systemPrompt = """
             Füge passende Emojis zum Text hinzu. Regeln:
-            - Maximal 1-2 Emojis pro Satz, dezent und passend.
-            - Emojis ans Satzende oder an passende Stellen setzen.
+            - Maximal 1-2 Emojis pro Eingabe, dezent.
+            - Erlaubt sind AUSSCHLIESSLICH:
+              • gelbe Gesichts-Emojis (z.B. 😊 🙂 😉 😎 🤔 🥲 🤓 🥸 🧐 🥳 🤩 😴)
+              • Hand-Emojis und Bizeps (z.B. 👋 👍 👌 ✋ ✌️ 🤝 🙏 🙌 💪)
+              • die drei Affen 🙈 🙉 🙊
+              • diese Symbole: ❤️ 💔 💯 🔥 ✅
+            - VERBOTEN: alle anderen Tiere, Katzen-Gesichter (😺 etc.), Personen mit Körpergesten (🙅 🙆 🙇 🙋 etc.), Clown 🤡, Teufel 😈, Engel, Geist, Totenkopf, Essen, Pflanzen, Objekte, Wetter, Flaggen, Aktivitäten, andere Symbole.
+            - Position: ans Satzende ODER mitten im Satz, dort wo es inhaltlich passt — nicht zwingend am Ende.
             - Den Text selbst NICHT verändern — nur Emojis hinzufügen.
             - Nur den Text mit Emojis ausgeben, nichts anderes.
             """
@@ -1754,61 +2109,174 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         let result = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? text : result
-    }
-
-    private func applyCustomPrompt(_ text: String) async throws -> String {
-        let apiKey = groqAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !apiKey.isEmpty else { return text }
-        let prompt = customPromptText
-        guard !prompt.isEmpty else { return text }
-
-        let payload: [String: Any] = [
-            "model": polishModel,
-            "temperature": 0.3,
-            "max_tokens": 2048,
-            "messages": [
-                ["role": "system", "content": prompt],
-                ["role": "user", "content": text]
-            ]
-        ]
-
-        let body = try JSONSerialization.data(withJSONObject: payload)
-
-        var request = URLRequest(url: URL(string: "https://api.groq.com/openai/v1/chat/completions")!)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = body
-        request.timeoutInterval = 10
-
-        let (responseData, response) = try await urlSession.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let errText = String(data: responseData, encoding: .utf8) ?? ""
-            throw NSError(domain: "flow", code: 50, userInfo: [NSLocalizedDescriptionKey: "Groq custom prompt fehlgeschlagen: \(errText)"])
-        }
-
-        guard let json = try JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let first = choices.first,
-              let message = first["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw NSError(domain: "flow", code: 51, userInfo: [NSLocalizedDescriptionKey: "Groq custom prompt: Antwort ohne content"])
-        }
-
-        let result = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return result.isEmpty ? text : result
+        guard !result.isEmpty else { return text }
+        let filtered = stripDisallowedEmojis(result)
+        return filtered.isEmpty ? text : filtered
     }
 
     private func transcribe(_ fileURL: URL) async throws -> String {
         let prompt = buildConditioningPrompt()
-        let text = try await transcribeWithGroq(fileURL, prompt: prompt)
-        logLine("FLOW transcribe backend=groq")
-        if isLikelyHallucination(text) || isLikelyBogusDomain(text) {
-            logLine("FLOW hallucination_rejected text=\(normalizedComparisonText(text))")
+        let chunkSeconds: Double = 50.0
+        let chunks = try await splitAudioForUpload(fileURL, maxChunkSeconds: chunkSeconds)
+
+        defer {
+            for chunkURL in chunks where chunkURL != fileURL {
+                try? FileManager.default.removeItem(at: chunkURL)
+            }
+        }
+
+        let combined: String
+        if chunks.count == 1 {
+            combined = try await transcribeChunkWithFallback(chunks[0], prompt: prompt, idx: 0)
+            logLine("FLOW transcribe backend=groq chunks=1")
+        } else {
+            logLine("FLOW transcribe_chunked count=\(chunks.count)")
+            var results = Array(repeating: "", count: chunks.count)
+            try await withThrowingTaskGroup(of: (Int, String).self) { group in
+                for (idx, chunkURL) in chunks.enumerated() {
+                    group.addTask { [weak self] in
+                        guard let self else { return (idx, "") }
+                        let text = try await self.transcribeChunkWithFallback(chunkURL, prompt: prompt, idx: idx)
+                        return (idx, text)
+                    }
+                }
+                for try await (idx, text) in group {
+                    results[idx] = text
+                }
+            }
+            combined = results
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            logLine("FLOW transcribe backend=groq+chunked chunks=\(chunks.count)")
+        }
+
+        if isLikelyHallucination(combined) || isLikelyBogusDomain(combined) {
+            logLine("FLOW hallucination_rejected text=\(normalizedComparisonText(combined))")
             throw NSError(domain: "flow", code: 205, userInfo: [NSLocalizedDescriptionKey: "Transkription war unklar"])
         }
-        return text
+        return combined
+    }
+
+    private func transcribeChunkWithFallback(_ url: URL, prompt: String, idx: Int) async throws -> String {
+        do {
+            return try await transcribeChunkWithRetry(url, prompt: prompt, attempts: 3)
+        } catch {
+            logLine("FLOW chunk_groq_failed idx=\(idx) error=\(error.localizedDescription) — local fallback")
+            do {
+                let text = try await transcribeWithLocalWhisper(url)
+                logLine("FLOW chunk_local_ok idx=\(idx)")
+                return text
+            } catch let localError {
+                logLine("FLOW chunk_local_failed idx=\(idx) error=\(localError.localizedDescription)")
+                throw error
+            }
+        }
+    }
+
+    private func transcribeChunkWithRetry(_ url: URL, prompt: String, attempts: Int) async throws -> String {
+        var lastError: Error?
+        for attempt in 1...attempts {
+            do {
+                return try await transcribeWithGroq(url, prompt: prompt)
+            } catch {
+                lastError = error
+                let nsError = error as NSError
+                let retriable = nsError.domain == NSURLErrorDomain && [
+                    NSURLErrorTimedOut,
+                    NSURLErrorNetworkConnectionLost,
+                    NSURLErrorCannotConnectToHost,
+                    NSURLErrorNotConnectedToInternet,
+                    NSURLErrorDNSLookupFailed,
+                    NSURLErrorResourceUnavailable
+                ].contains(nsError.code)
+                logLine("FLOW chunk_attempt=\(attempt) error=\(error.localizedDescription) retriable=\(retriable)")
+                if attempt < attempts && retriable {
+                    let backoff = pow(2.0, Double(attempt - 1)) * 0.5
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastError ?? NSError(domain: "flow", code: 999, userInfo: [NSLocalizedDescriptionKey: "Unbekannter Transkriptionsfehler"])
+    }
+
+    private func splitAudioForUpload(_ url: URL, maxChunkSeconds: Double) async throws -> [URL] {
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        let totalSeconds = CMTimeGetSeconds(duration)
+
+        guard totalSeconds.isFinite, totalSeconds > maxChunkSeconds + 5.0 else {
+            return [url]
+        }
+
+        let chunkCount = Int(ceil(totalSeconds / maxChunkSeconds))
+        var chunks: [URL] = []
+        let baseName = url.deletingPathExtension().lastPathComponent
+
+        for i in 0..<chunkCount {
+            let start = Double(i) * maxChunkSeconds
+            let end = min(start + maxChunkSeconds, totalSeconds)
+            let chunkURL = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("\(baseName)-chunk\(i).m4a")
+            try? FileManager.default.removeItem(at: chunkURL)
+
+            guard let exporter = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+                throw NSError(domain: "flow", code: 300, userInfo: [NSLocalizedDescriptionKey: "Export-Session konnte nicht erstellt werden"])
+            }
+            exporter.timeRange = CMTimeRange(
+                start: CMTime(seconds: start, preferredTimescale: 600),
+                end: CMTime(seconds: end, preferredTimescale: 600)
+            )
+            try await exporter.export(to: chunkURL, as: .m4a)
+            chunks.append(chunkURL)
+        }
+
+        logLine("FLOW audio_split totalSeconds=\(String(format: "%.2f", totalSeconds)) chunks=\(chunkCount)")
+        return chunks
+    }
+
+    private func transcribeWithLocalWhisper(_ url: URL) async throws -> String {
+        let helperURL = flowHomeURL.appendingPathComponent("local_whisper_transcribe.py")
+        guard FileManager.default.fileExists(atPath: helperURL.path) else {
+            throw NSError(domain: "flow", code: 401, userInfo: [NSLocalizedDescriptionKey: "Lokaler Whisper-Helper fehlt"])
+        }
+
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                process.arguments = ["python3", helperURL.path, "--audio", url.path]
+
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
+
+                do {
+                    try process.run()
+                } catch {
+                    cont.resume(throwing: error)
+                    return
+                }
+                process.waitUntilExit()
+
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                guard process.terminationStatus == 0 else {
+                    let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    cont.resume(throwing: NSError(domain: "flow", code: 402, userInfo: [NSLocalizedDescriptionKey: "local whisper exit \(process.terminationStatus): \(errText.prefix(200))"]))
+                    return
+                }
+
+                guard let json = try? JSONSerialization.jsonObject(with: outData) as? [String: Any],
+                      let text = json["text"] as? String else {
+                    cont.resume(throwing: NSError(domain: "flow", code: 403, userInfo: [NSLocalizedDescriptionKey: "Local Whisper Antwort ohne Text"]))
+                    return
+                }
+                cont.resume(returning: text)
+            }
+        }
     }
 
     private func buildConditioningPrompt() -> String {
@@ -1822,7 +2290,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if terms.isEmpty {
-            terms = ["Klaus Flow", "Groq", "Claude", "OpenClaw"]
+            terms = ["Klaus", "Groq", "Claude", "denzer.ai"]
         }
         return terms.joined(separator: ", ")
     }
@@ -1917,8 +2385,28 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
 
-    private struct DictionaryConfig: Codable {
+    fileprivate struct DictionaryConfig: Codable {
         let replacements: [String: String]
+    }
+
+    fileprivate func dictionaryEntries() -> [(key: String, value: String)] {
+        guard let config = loadDictionaryConfig() else { return [] }
+        return config.replacements
+            .map { (key: $0.key, value: $0.value) }
+            .sorted { $0.key.localizedCompare($1.key) == .orderedAscending }
+    }
+
+    fileprivate func saveDictionaryEntries(_ entries: [(key: String, value: String)]) {
+        var dict = [String: String]()
+        for entry in entries {
+            let trimmedKey = entry.key.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedKey.isEmpty else { continue }
+            dict[trimmedKey] = entry.value
+        }
+        let payload: [String: Any] = ["replacements": dict]
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: dictionaryFileURL, options: .atomic)
+        }
     }
 
     private func applyDictionaryReplacements(to text: String) -> String {
@@ -2011,10 +2499,10 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
           "replacements": {
             "grog": "Groq",
             "grock": "Groq",
-            "open claw": "OpenClaw",
             "claude": "Claude",
             "claude code": "Claude Code",
-            "klaus flow": "Klaus Flow"
+            "klaus flow": "Klaus",
+            "denzer ai": "denzer.ai"
           }
         }
         """
@@ -2043,80 +2531,12 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func sendToKlausBotIfRunning(_ text: String) async -> Bool {
-        // Try to reach the Klaus bot on localhost:9921
-        // If it responds, send the text as a command and return true
-        // If not reachable, return false (normal paste flow continues)
-        guard let url = URL(string: "http://127.0.0.1:9921/command") else { return false }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 1.0  // Fast timeout — don't block if bot isn't running
-        let body: [String: Any] = ["text": text]
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return false }
-        req.httpBody = bodyData
-        do {
-            let (data, response) = try await URLSession.shared.data(for: req)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else { return false }
-            logLine("FLOW klaus_bot_response \(String(data: data, encoding: .utf8) ?? "")")
-            return true
-        } catch {
-            // Bot not running — fall through to normal paste
-            return false
-        }
-    }
-
-    private func isFrontmostAppWoW() -> Bool {
-        guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
-        return bundleID.lowercased().contains("blizzard.worldofwarcraft")
-    }
-
-    private func autoOpenChatReturnIfPossible() async -> Bool {
-        let hasAccessibility = checkAccessibility()
-        if hasAccessibility {
-            await releaseSyntheticModifiersIfNeeded()
-        }
-        try? await Task.sleep(nanoseconds: 60_000_000)
-        let postedEvents = hasAccessibility ? await MainActor.run {
-            guard let source = syntheticKeyEventSource(),
-                  let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else {
-                return false
-            }
-            keyDown.flags = []
-            keyUp.flags = []
-            keyDown.post(tap: .cghidEventTap)
-            keyUp.post(tap: .cghidEventTap)
-            return true
-        } : false
-        if postedEvents {
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            logLine("FLOW wow_open_chat postedEvents=true")
-            return true
-        }
-        let scriptSuccess = runSendAppleScriptFallback()
-        logLine("FLOW wow_open_chat postedEvents=false scriptFallback=\(scriptSuccess)")
-        return scriptSuccess
-    }
-
     private func performLocalPasteActionIfPossible() async -> (pasted: Bool, sent: Bool) {
-        let isWoW = isFrontmostAppWoW()
-        if isWoW {
-            logLine("FLOW wow_detected opening chat before paste")
-        }
         switch outputMode {
         case .paste:
-            if isWoW {
-                let opened = await autoOpenChatReturnIfPossible()
-                guard opened else { return (false, false) }
-            }
             let pasted = await autoPasteClipboardIfPossible()
             return (pasted, false)
         case .pasteSend:
-            if isWoW {
-                let opened = await autoOpenChatReturnIfPossible()
-                guard opened else { return (false, false) }
-            }
             let pasted = await autoPasteClipboardIfPossible()
             guard pasted else { return (false, false) }
             let sent = await autoSendReturnIfPossible()
@@ -2255,7 +2675,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return ranAny
     }
 
-    private func checkAccessibility() -> Bool {
+    fileprivate func checkAccessibility() -> Bool {
         if AXIsProcessTrusted() {
             return true
         }
@@ -2268,9 +2688,16 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func playSuccessSound() {
-        guard successSoundVolume > 0 else { return }
+        guard soundEnabled, successSoundVolume > 0 else { return }
         DispatchQueue.main.async {
-            if let sound = NSSound(named: NSSound.Name(self.successSoundName)) {
+            let sound: NSSound?
+            if let relPath = self.wowSoundFiles[self.successSoundName] {
+                let url = self.flowHomeURL.appendingPathComponent(relPath)
+                sound = NSSound(contentsOf: url, byReference: true)
+            } else {
+                sound = NSSound(named: NSSound.Name(self.successSoundName))
+            }
+            if let sound {
                 sound.stop()
                 sound.volume = Float(self.successSoundVolume)
                 sound.play()
@@ -2282,7 +2709,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         "Lautstärke \(Int((successSoundVolume * 100).rounded()))%"
     }
 
-    private func checkAutomationPermission(promptIfNeeded: Bool) -> Bool {
+    fileprivate func checkAutomationPermission(promptIfNeeded: Bool) -> Bool {
         let source = "tell application \"System Events\" to get name of first process"
         guard let script = NSAppleScript(source: source) else { return false }
         var errorInfo: NSDictionary?
@@ -2310,16 +2737,22 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = mode == outputMode ? .on : .off
         }
         volumeValueItem?.title = soundVolumeLabel()
-        for (name, item) in soundItems {
-            item.state = name == successSoundName ? .on : .off
-        }
+        soundEnabledMenuItem?.state = soundEnabled ? .on : .off
         polishMenuItem?.state = polishEnabled ? .on : .off
         translateMenuItem?.state = translateEnabled ? .on : .off
-        roleplayMenuItem?.state = roleplayEnabled ? .on : .off
         emojiMenuItem?.state = emojiEnabled ? .on : .off
-        customPromptMenuItem?.state = customPromptEnabled ? .on : .off
         autoDetectMenuItem?.state = autoDetectLanguage ? .on : .off
         pauseMenuItem?.state = paused ? .on : .off
+        autostartMenuItem?.state = autostartEnabled ? .on : .off
+        invertedMenuItem?.state = invertedMode ? .on : .off
+    }
+
+    @objc private func toggleAutostart(_ sender: NSMenuItem) {
+        autostartEnabled.toggle()
+    }
+
+    @objc private func toggleInverted(_ sender: NSMenuItem) {
+        invertedMode.toggle()
     }
 
     @objc private func togglePolish(_ sender: NSMenuItem) {
@@ -2330,50 +2763,12 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         translateEnabled.toggle()
     }
 
-    @objc private func toggleRoleplay(_ sender: NSMenuItem) {
-        roleplayEnabled.toggle()
-    }
-
     @objc private func toggleEmoji(_ sender: NSMenuItem) {
         emojiEnabled.toggle()
     }
 
     @objc private func toggleAutoDetect(_ sender: NSMenuItem) {
         autoDetectLanguage.toggle()
-    }
-
-    @objc private func configureCustomPrompt(_ sender: Any?) {
-        NSApp.activate(ignoringOtherApps: true)
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 360, height: 80))
-        textView.isEditable = true
-        textView.isSelectable = true
-        textView.font = .systemFont(ofSize: 13)
-        textView.string = customPromptText
-        textView.isRichText = false
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 360, height: 80))
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .bezelBorder
-
-        let toggle = NSButton(checkboxWithTitle: "Aktiv", target: nil, action: nil)
-        toggle.state = customPromptEnabled ? .on : .off
-
-        let stack = NSStackView(views: [scrollView, toggle])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 360, height: 110)
-
-        let alert = NSAlert()
-        alert.messageText = "Custom Prompt"
-        alert.informativeText = "Eigene Anweisung für die Textverarbeitung nach der Transkription."
-        alert.accessoryView = stack
-        alert.addButton(withTitle: "Speichern")
-        alert.addButton(withTitle: "Abbrechen")
-        if alert.runModal() == .alertFirstButtonReturn {
-            customPromptText = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            customPromptEnabled = toggle.state == .on
-        }
     }
 
     @objc private func togglePause(_ sender: NSMenuItem) {
@@ -2394,88 +2789,59 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         outputMode = mode
     }
 
-    @objc private func selectSound(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        successSoundName = name
+    @objc private func toggleSoundEnabled(_ sender: NSMenuItem) {
+        soundEnabled.toggle()
     }
 
     @objc private func soundVolumeChanged(_ sender: NSSlider) {
         successSoundVolume = sender.doubleValue
     }
 
-    @objc private func configureGroqKey(_ sender: Any?) {
+    @objc private func openSettings(_ sender: Any?) {
+        if settingsWindowController == nil {
+            settingsWindowController = SettingsWindowController(app: self)
+        }
         NSApp.activate(ignoringOtherApps: true)
-        let field = NSSecureTextField(string: groqAPIKey)
-        field.frame = NSRect(x: 0, y: 0, width: 360, height: 24)
+        settingsWindowController?.showWindow(nil)
+        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func showAbout(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Groq API Key"
-        alert.informativeText = "Wird lokal gespeichert und nur für Transkription genutzt."
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Speichern")
-        alert.addButton(withTitle: "Abbrechen")
-        if alert.runModal() == .alertFirstButtonReturn {
-            groqAPIKey = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-    }
+        alert.messageText = "Klaus"
+        alert.informativeText = """
+        Lokale Push-to-Talk-Transkription via Groq Whisper.
 
-    @objc private func openDictionary(_ sender: Any?) {
-        ensureDictionaryFileExists()
-        NSWorkspace.shared.open(dictionaryFileURL)
-    }
+        PTT: ⌘ rechts halten
+        Optional: Text polieren · Übersetzen → Englisch · Emoji · Sprache auto
 
-    @objc private func checkPermissions(_ sender: Any?) {
-        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
-        let micText: String
-        switch micStatus {
-        case .authorized: micText = "ok"
-        case .denied: micText = "blockiert"
-        case .restricted: micText = "eingeschränkt"
-        case .notDetermined: micText = "offen"
-        @unknown default: micText = "unbekannt"
-        }
-
-        let accessibility = checkAccessibility()
-        let automation = checkAutomationPermission(promptIfNeeded: true)
-
-        let micSymbol = micText == "ok" ? "✓" : "✕"
-        let accSymbol = accessibility ? "✓" : "✕"
-        let autoSymbol = automation ? "✓" : "✕"
-
-        let message = """
-        \(micSymbol)  Mikrofon: \(micText)
-        \(accSymbol)  Bedienungshilfen: \(accessibility ? "ok" : "fehlt")
-        \(autoSymbol)  Automation: \(automation ? "ok" : "fehlt")
+        Made with care by denzer.ai · Open Source
         """
-        logLine("FLOW permissions mic=\(micText) accessibility=\(accessibility) automation=\(automation)")
-
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Klaus Flow Rechte"
-
-        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 320, height: 72))
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
-        textView.string = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        alert.accessoryView = textView
-
         alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Kopieren")
-
+        alert.addButton(withTitle: "denzer.ai öffnen")
         let response = alert.runModal()
         if response == .alertSecondButtonReturn {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(message.trimmingCharacters(in: .whitespacesAndNewlines), forType: .string)
+            if let url = URL(string: "https://denzer.ai") {
+                NSWorkspace.shared.open(url)
+            }
         }
     }
 
-    @objc private func openLogs(_ sender: Any?) {
-        let logsDir = flowHomeURL.appendingPathComponent("logs", isDirectory: true)
-        NSWorkspace.shared.open(logsDir)
-    }
 
     @objc private func quit() {
+        // launchctl unload, sonst respawnt KeepAlive=true die App sofort.
+        // Die Plist bleibt im LaunchAgents-Folder — kommt beim nächsten Login je nach RunAtLoad zurück.
+        let task = Process()
+        task.launchPath = "/bin/launchctl"
+        task.arguments = ["unload", launchAgentPlistURL.path]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            logLine("FLOW quit launchctl_unload status=\(task.terminationStatus)")
+        } catch {
+            logLine("FLOW quit launchctl_unload_failed=\(error.localizedDescription)")
+        }
         NSApp.terminate(nil)
     }
 
@@ -2497,6 +2863,65 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logLine("FLOW pane_hotkeys_ready cmd+1..4 endpoint=\(paneEndpointURL.absoluteString) tokenSet=\(!paneAuthToken.isEmpty)")
     }
 
+    private func setupPaneArrowEventTap() {
+        // Globaler Event-Tap, der nur während aktiver Pane-Aufnahme Pfeiltasten links/rechts
+        // abfängt und damit den activePanePttIndex live umschaltet. Außerhalb des Pane-Recording
+        // werden die Events unverändert weitergereicht — normales Pfeiltasten-Verhalten bleibt.
+        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
+            let app = Unmanaged<KlausFlowApp>.fromOpaque(refcon).takeUnretainedValue()
+            return app.handlePaneArrowEvent(type: type, event: event)
+        }
+        let opaqueSelf = Unmanaged.passUnretained(self).toOpaque()
+        guard let tap = CGEvent.tapCreate(
+            tap: .cghidEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: mask,
+            callback: callback,
+            userInfo: opaqueSelf
+        ) else {
+            logLine("FLOW pane_arrow_tap_failed")
+            return
+        }
+        let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+        paneArrowEventTap = tap
+        paneArrowRunLoopSource = source
+        logLine("FLOW pane_arrow_tap_ready")
+    }
+
+    fileprivate func handlePaneArrowEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+        // Nur aktiv während laufender Pane-Aufnahme, sonst durchreichen.
+        guard isRecordingPane, let active = activePanePttIndex else {
+            return Unmanaged.passUnretained(event)
+        }
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        // 123 = LeftArrow, 124 = RightArrow
+        if keyCode == 123 {
+            let next = max(0, active - 1)
+            if next != active {
+                activePanePttIndex = next
+                pill.setPaneTarget(next + 1)
+                logLine("FLOW pane_switch_arrow from=\(active + 1) to=\(next + 1) dir=left")
+            }
+            return nil
+        }
+        if keyCode == 124 {
+            let next = min(3, active + 1)
+            if next != active {
+                activePanePttIndex = next
+                pill.setPaneTarget(next + 1)
+                logLine("FLOW pane_switch_arrow from=\(active + 1) to=\(next + 1) dir=right")
+            }
+            return nil
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
     fileprivate func syncPaneHotkeyState() {
         // Transition-based: react only on press transitions (false → true).
         // Releases just update the previous-state mirror.
@@ -2510,31 +2935,32 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handlePanePressTransition(idx: Int) {
+        let now = Date()
+        let sinceLast = now.timeIntervalSince(lastPanePressAt[idx])
+        if sinceLast < paneDebounceInterval {
+            logLine("FLOW pane_press_debounced pane=\(idx + 1) sinceLastMs=\(Int(sinceLast * 1000))")
+            return
+        }
+        lastPanePressAt[idx] = now
+
         if let active = activePanePttIndex {
-            // Recording in progress.
+            // Recording in progress. Any second press finalises the recording — never cancel,
+            // never redirect to clipboard. A wrong button still delivers to the originally
+            // targeted pane (or focused field, in focus mode).
             if paneFocusActive {
-                // Focus mode (double-tap-promoted): same button = stop+paste, other button = cancel.
-                if active == idx {
-                    logLine("FLOW pane_focus_stop_paste pane=\(idx + 1)")
-                    activePanePttIndex = nil
-                    paneFocusActive = false
-                    pill.setFocusMode(false)
-                    stopPaneRecordingAndDeliver(target: .focusedField)
-                } else {
-                    logLine("FLOW pane_focus_cancelled trigger=\(idx + 1)")
-                    paneFocusActive = false
-                    pill.setFocusMode(false)
-                    cancelPaneRecording()
-                }
+                logLine("FLOW pane_focus_stop_paste pane=\(active + 1) trigger=\(idx + 1)")
+                activePanePttIndex = nil
+                paneFocusActive = false
+                pill.setFocusMode(false)
+                stopPaneRecordingAndDeliver(target: .focusedField)
                 return
             }
 
-            // Normal pane recording.
             if active == idx {
-                // Same button: check for focus-mode upgrade window (only on pane 1).
+                // Same button: check for focus-mode upgrade window (any pane).
                 let elapsed = Date().timeIntervalSince(paneRecordingStartedAt)
                 let upgradeWindow = Double(paneFocusUpgradeWindowMs) / 1000.0
-                if active == paneFocusUpgradeIndex && elapsed < upgradeWindow {
+                if elapsed < upgradeWindow {
                     paneFocusActive = true
                     pill.setFocusMode(true)
                     logLine("FLOW pane_focus_upgraded pane=\(idx + 1) elapsed=\(String(format: "%.3f", elapsed))")
@@ -2544,10 +2970,9 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 activePanePttIndex = nil
                 stopPaneRecordingAndDeliver(target: .pane(idx + 1))
             } else {
-                // Different button: clipboard redirect.
-                logLine("FLOW pane_tap_redirect_clipboard from=\(active + 1) trigger=\(idx + 1)")
+                logLine("FLOW pane_tap_stop_send_other_button from=\(active + 1) trigger=\(idx + 1)")
                 activePanePttIndex = nil
-                stopPaneRecordingAndDeliver(target: .clipboard)
+                stopPaneRecordingAndDeliver(target: .pane(active + 1))
             }
             return
         }
@@ -2586,6 +3011,20 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             input.removeTap(onBus: 0)
             logLine("FLOW preroll_engine_start_failed \(error.localizedDescription)")
         }
+    }
+
+    private func stopPreRollEngine() {
+        guard let engine = preRollEngine else { return }
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        preRollEngine = nil
+        preRollFormat = nil
+        preRollLock.lock()
+        preRollRing.removeAll(keepingCapacity: true)
+        preRollRingFrames = 0
+        lastPaneAudioPower = -160.0
+        preRollLock.unlock()
+        logLine("FLOW preroll_engine_stopped")
     }
 
     private func handlePreRollTap(buffer: AVAudioPCMBuffer) {
@@ -2672,7 +3111,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ensurePreRollEngine()
         guard let format = preRollFormat else {
             logLine("FLOW pane_recording_failed pane=\(pane) error=preroll_engine_unavailable")
-            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            stopPreRollEngine()
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
             activePanePttIndex = nil
             return
         }
@@ -2708,6 +3148,8 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let preRollMs = Int(Double(preRollFrames) * 1000.0 / format.sampleRate)
             logLine("FLOW pane_recording_started pane=\(pane) path=\(tmp.path) preRollMs=\(preRollMs)")
             pill.resetRecordingWave()
+            pill.resetRecordingTime()
+            pill.setPaneTarget(pane)
             pill.show(state: .recording, mode: outputMode)
             startPaneMeterUpdates()
         } catch {
@@ -2715,8 +3157,9 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             paneRecordingActive = false
             paneAudioFile = nil
             preRollLock.unlock()
+            stopPreRollEngine()
             logLine("FLOW pane_recording_failed pane=\(pane) error=\(error.localizedDescription)")
-            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
             activePanePttIndex = nil
         }
     }
@@ -2735,6 +3178,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preRollRingFrames = 0
         lastPaneAudioPower = -160.0
         preRollLock.unlock()
+        stopPreRollEngine()
         let duration = max(0, Date().timeIntervalSince(paneRecordingStartedAt))
         paneRecordingStartedAt = Date.distantPast
         let capturedMaxLevel = paneRecordingMaxLevel
@@ -2743,7 +3187,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logLine("FLOW pane_recording_stopped target=\(targetLabel) duration=\(String(format: "%.2f", duration)) maxLevel=\(String(format: "%.3f", capturedMaxLevel))")
 
         guard let url = paneAudioURL else {
-            pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+            pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
             return
         }
         paneAudioURL = nil
@@ -2782,13 +3226,14 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         preRollRingFrames = 0
         lastPaneAudioPower = -160.0
         preRollLock.unlock()
+        stopPreRollEngine()
         paneRecordingStartedAt = Date.distantPast
         paneRecordingMaxLevel = 0.0
         if let url = paneAudioURL {
             try? FileManager.default.removeItem(at: url)
         }
         paneAudioURL = nil
-        pill.show(state: .failure, mode: outputMode, autoHideAfter: 1.2)
+        pill.show(state: .failure, mode: outputMode, autoHideAfter: 0.8)
     }
 
     private func paneTargetLabel(_ target: PaneDeliveryTarget) -> String {
@@ -2814,7 +3259,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             logLine("FLOW pane_transcript target=\(paneTargetLabel(target)) text=\(trimmed)")
             guard !trimmed.isEmpty else {
-                await showPill(.failure, autoHideAfter: 1.2)
+                await showPill(.failure, autoHideAfter: 0.8)
                 return
             }
             switch target {
@@ -2882,6 +3327,7 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let level = self.normalizedAudioLevel(fromPower: power)
             if level > self.paneRecordingMaxLevel { self.paneRecordingMaxLevel = level }
             self.pill.updateRecordingLevel(level)
+            self.pill.setRecordingTime(Date().timeIntervalSince(self.paneRecordingStartedAt))
         }
         paneRecordingMeterTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -2894,6 +3340,276 @@ final class KlausFlowApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) {
         refreshMenu()
+    }
+}
+
+// MARK: - Settings Window
+
+final class SettingsWindowController: NSWindowController, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate {
+    private weak var app: KlausFlowApp?
+    private var apiKeyField: NSSecureTextField!
+    private var modelField: NSTextField!
+    private var micLabel: NSTextField!
+    private var accLabel: NSTextField!
+    private var autoLabel: NSTextField!
+    private var dictionaryEntries: [(key: String, value: String)] = []
+    private var dictionaryTableView: NSTableView!
+
+    init(app: KlausFlowApp) {
+        self.app = app
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 720),
+            styleMask: [.titled, .closable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Klaus Einstellungen"
+        window.minSize = NSSize(width: 480, height: 540)
+        window.center()
+        window.isReleasedWhenClosed = false
+        super.init(window: window)
+        window.delegate = self
+        dictionaryEntries = app.dictionaryEntries()
+        buildContent()
+        refreshPermissions()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not implemented") }
+
+    private func buildContent() {
+        guard let window = self.window, let content = window.contentView else { return }
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 22, left: 24, bottom: 22, right: 24)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: content.topAnchor),
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        ])
+
+        let fieldWidth: CGFloat = 420
+
+        stack.addArrangedSubview(sectionHeader("Groq API Key"))
+        apiKeyField = NSSecureTextField()
+        apiKeyField.stringValue = app?.groqAPIKey ?? ""
+        apiKeyField.placeholderString = "gsk_..."
+        apiKeyField.widthAnchor.constraint(equalToConstant: fieldWidth).isActive = true
+        stack.addArrangedSubview(apiKeyField)
+        stack.addArrangedSubview(hint("Wird lokal gespeichert. Nur für Whisper + Polish/Translate genutzt."))
+        stack.setCustomSpacing(18, after: stack.arrangedSubviews.last!)
+
+        stack.addArrangedSubview(sectionHeader("Polish-Modell"))
+        modelField = NSTextField()
+        modelField.stringValue = app?.polishModel ?? ""
+        modelField.placeholderString = "llama-3.1-70b-versatile"
+        modelField.widthAnchor.constraint(equalToConstant: fieldWidth).isActive = true
+        stack.addArrangedSubview(modelField)
+        stack.addArrangedSubview(hint("Groq-Modell für Stil-Glättung, Übersetzen, Emoji."))
+        stack.setCustomSpacing(18, after: stack.arrangedSubviews.last!)
+
+        stack.addArrangedSubview(sectionHeader("Berechtigungen"))
+        micLabel = statusLabel("—")
+        accLabel = statusLabel("—")
+        autoLabel = statusLabel("—")
+        stack.addArrangedSubview(micLabel)
+        stack.addArrangedSubview(accLabel)
+        stack.addArrangedSubview(autoLabel)
+        let refreshBtn = NSButton(title: "Erneut prüfen", target: self, action: #selector(refreshPermissionsAction(_:)))
+        refreshBtn.bezelStyle = .rounded
+        stack.addArrangedSubview(refreshBtn)
+        stack.setCustomSpacing(20, after: refreshBtn)
+
+        // Wörterbuch
+        stack.addArrangedSubview(sectionHeader("Wörterbuch"))
+        stack.addArrangedSubview(hint("Klaus ersetzt diese Begriffe in jedem Transkript. Linke Spalte: was Klaus hört. Rechte Spalte: was eingefügt wird."))
+        let scrollView = makeDictionaryTable()
+        stack.addArrangedSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.widthAnchor.constraint(equalToConstant: 420),
+            scrollView.heightAnchor.constraint(equalToConstant: 180)
+        ])
+
+        let dictBtns = NSStackView()
+        dictBtns.orientation = .horizontal
+        dictBtns.spacing = 6
+        let addBtn = NSButton(title: "＋", target: self, action: #selector(addDictEntry(_:)))
+        addBtn.bezelStyle = .rounded
+        let removeBtn = NSButton(title: "−", target: self, action: #selector(removeDictEntry(_:)))
+        removeBtn.bezelStyle = .rounded
+        dictBtns.addArrangedSubview(addBtn)
+        dictBtns.addArrangedSubview(removeBtn)
+        stack.addArrangedSubview(dictBtns)
+        stack.setCustomSpacing(20, after: dictBtns)
+
+        let logsBtn = NSButton(title: "Logs öffnen…", target: self, action: #selector(openLogsAction(_:)))
+        logsBtn.bezelStyle = .rounded
+        stack.addArrangedSubview(logsBtn)
+        stack.setCustomSpacing(18, after: logsBtn)
+
+        let saveBtn = NSButton(title: "Speichern", target: self, action: #selector(saveAndClose(_:)))
+        saveBtn.bezelStyle = .rounded
+        saveBtn.keyEquivalent = "\r"
+        stack.addArrangedSubview(saveBtn)
+    }
+
+    private func sectionHeader(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .boldSystemFont(ofSize: 13)
+        return label
+    }
+
+    private func hint(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.widthAnchor.constraint(equalToConstant: 420).isActive = true
+        return label
+    }
+
+    private func statusLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 12)
+        return label
+    }
+
+    @objc private func refreshPermissionsAction(_ sender: Any?) {
+        refreshPermissions()
+    }
+
+    private func refreshPermissions() {
+        guard let app else { return }
+        let micStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+        let micText: String
+        switch micStatus {
+        case .authorized: micText = "ok"
+        case .denied: micText = "blockiert"
+        case .restricted: micText = "eingeschränkt"
+        case .notDetermined: micText = "noch nicht gefragt"
+        @unknown default: micText = "unbekannt"
+        }
+        micLabel.stringValue = "\(micStatus == .authorized ? "✓" : "✕")  Mikrofon: \(micText)"
+        let acc = AXIsProcessTrusted()
+        accLabel.stringValue = "\(acc ? "✓" : "✕")  Bedienungshilfen: \(acc ? "ok" : "fehlt")"
+        let auto = app.checkAutomationPermission(promptIfNeeded: false)
+        autoLabel.stringValue = "\(auto ? "✓" : "✕")  Automation: \(auto ? "ok" : "fehlt")"
+    }
+
+    @objc private func openLogsAction(_ sender: Any?) {
+        guard let app else { return }
+        let logsDir = app.flowHomeURL.appendingPathComponent("logs", isDirectory: true)
+        NSWorkspace.shared.open(logsDir)
+    }
+
+    @objc private func saveAndClose(_ sender: Any?) {
+        guard let app else { return }
+        app.groqAPIKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !model.isEmpty {
+            app.polishModel = model
+        }
+        persistDictionary()
+        self.close()
+    }
+
+    // MARK: - Wörterbuch-Tabelle
+
+    private func makeDictionaryTable() -> NSScrollView {
+        let table = NSTableView()
+        table.translatesAutoresizingMaskIntoConstraints = false
+        table.allowsMultipleSelection = false
+        table.usesAlternatingRowBackgroundColors = true
+        table.gridStyleMask = []
+        table.headerView = NSTableHeaderView()
+        table.dataSource = self
+        table.delegate = self
+        table.rowHeight = 22
+
+        let keyCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("key"))
+        keyCol.title = "Was Klaus hört"
+        keyCol.width = 180
+        keyCol.minWidth = 120
+        table.addTableColumn(keyCol)
+
+        let valCol = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("value"))
+        valCol.title = "Wird ersetzt durch"
+        valCol.width = 220
+        valCol.minWidth = 140
+        table.addTableColumn(valCol)
+
+        dictionaryTableView = table
+
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.borderType = .lineBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.documentView = table
+        scroll.autohidesScrollers = false
+        return scroll
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        return dictionaryEntries.count
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let columnId = tableColumn?.identifier.rawValue, row < dictionaryEntries.count else { return nil }
+        let entry = dictionaryEntries[row]
+        let field = NSTextField()
+        field.isEditable = true
+        field.isBordered = false
+        field.drawsBackground = false
+        field.font = .systemFont(ofSize: 12)
+        field.tag = row * 2 + (columnId == "key" ? 0 : 1)
+        field.target = self
+        field.action = #selector(dictCellEdited(_:))
+        if columnId == "key" {
+            field.stringValue = entry.key
+            field.placeholderString = "Was Klaus hört…"
+        } else {
+            field.stringValue = entry.value
+            field.placeholderString = "…wird ersetzt durch"
+        }
+        return field
+    }
+
+    @objc private func dictCellEdited(_ sender: NSTextField) {
+        let row = sender.tag / 2
+        let isKey = sender.tag % 2 == 0
+        guard row < dictionaryEntries.count else { return }
+        if isKey {
+            dictionaryEntries[row].key = sender.stringValue
+        } else {
+            dictionaryEntries[row].value = sender.stringValue
+        }
+        persistDictionary()
+    }
+
+    @objc private func addDictEntry(_ sender: Any?) {
+        dictionaryEntries.append((key: "", value: ""))
+        dictionaryTableView.reloadData()
+        let newRow = dictionaryEntries.count - 1
+        dictionaryTableView.scrollRowToVisible(newRow)
+        dictionaryTableView.selectRowIndexes(IndexSet(integer: newRow), byExtendingSelection: false)
+        dictionaryTableView.editColumn(0, row: newRow, with: nil, select: true)
+    }
+
+    @objc private func removeDictEntry(_ sender: Any?) {
+        let selected = dictionaryTableView.selectedRow
+        guard selected >= 0, selected < dictionaryEntries.count else { return }
+        dictionaryEntries.remove(at: selected)
+        dictionaryTableView.reloadData()
+        persistDictionary()
+    }
+
+    private func persistDictionary() {
+        app?.saveDictionaryEntries(dictionaryEntries)
     }
 }
 

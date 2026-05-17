@@ -21,8 +21,16 @@ def main() -> int:
     try:
         import imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        ffmpeg_dir = str(Path(ffmpeg_exe).resolve().parent)
-        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+        # imageio's binary is named "ffmpeg-macos-aarch64-..."; mlx_whisper invokes the
+        # bare command "ffmpeg" via subprocess. Stage a symlink under a stable name.
+        link_dir = Path.home() / ".klaus-flow" / ".ffmpeg-shim"
+        link_dir.mkdir(parents=True, exist_ok=True)
+        link_path = link_dir / "ffmpeg"
+        if not link_path.exists() or link_path.resolve() != Path(ffmpeg_exe).resolve():
+            if link_path.exists() or link_path.is_symlink():
+                link_path.unlink()
+            link_path.symlink_to(ffmpeg_exe)
+        os.environ["PATH"] = str(link_dir) + os.pathsep + os.environ.get("PATH", "")
     except Exception:
         pass
 

@@ -11,10 +11,11 @@ set -euo pipefail
 
 SRC_DIR="/Users/christian/.klaus-flow"
 SRC="$SRC_DIR/klaus-flow.swift"
-APP_DIR="/Users/christian/Applications/Klaus Flow.app"
+APP_DIR="/Users/christian/Applications/Klaus.app"
 TARGET_BIN="$APP_DIR/Contents/MacOS/klaus-flow"
 TMP_BIN="$SRC_DIR/klaus-flow.build"
 LOG="$SRC_DIR/build.log"
+LAUNCH_PLIST="$HOME/Library/LaunchAgents/ai.denzer.klaus.plist"
 
 RESTART=1
 DEPLOY=1
@@ -46,28 +47,33 @@ fi
 
 echo "[build] ok ($(stat -f%z "$TMP_BIN") bytes)"
 
+# Ad-hoc re-sign so the embedded signing ID matches the final filename.
+# Without this, launchctl-based restarts trip Launch Constraint Violations
+# because swiftc embeds "klaus-flow.build" as the codesigning ID.
+codesign --force --sign - "$TMP_BIN" 2>&1 | sed 's/^/[build] /' || true
+
 if [[ "$DEPLOY" -eq 0 ]]; then
   echo "[build] --build-only: leaving binary at $TMP_BIN"
   exit 0
 fi
 
-if [[ "$RESTART" -eq 1 ]]; then
-  RUNNING_PID="$(pgrep -f "Klaus Flow.app/Contents/MacOS/klaus-flow" || true)"
-  if [[ -n "$RUNNING_PID" ]]; then
-    echo "[deploy] killing running klaus-flow (pid $RUNNING_PID)"
-    kill "$RUNNING_PID" || true
-    sleep 0.4
-  fi
-fi
-
+# Copy binary BEFORE touching the running process — launchd has KeepAlive=true,
+# so any kill triggers an instant respawn. We need the new binary on disk first.
 echo "[deploy] $TMP_BIN -> $TARGET_BIN"
 cp "$TMP_BIN" "$TARGET_BIN"
 chmod +x "$TARGET_BIN"
 rm -f "$TMP_BIN"
 
+# Deep re-sign the whole bundle so Gatekeeper/TCC accept it after the binary swap.
+# Required because copying a new binary invalidates the bundle-level seal.
+echo "[deploy] deep-resign bundle"
+codesign --force --deep --sign - --identifier ai.denzer.klaus "$APP_DIR" 2>&1 | sed 's/^/[deploy] /' || true
+
 if [[ "$RESTART" -eq 1 ]]; then
-  echo "[deploy] launching"
-  open -a "$APP_DIR"
+  echo "[deploy] reload launchd service ($LAUNCH_PLIST)"
+  launchctl unload "$LAUNCH_PLIST" 2>/dev/null || true
+  sleep 0.3
+  launchctl load "$LAUNCH_PLIST"
 fi
 
 echo "[done] klaus-flow updated"

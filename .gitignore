@@ -23,3 +23,6 @@ logs/
 .venv/
 __pycache__/
 *.pyc
+
+# Local-only symlinks
+.ffmpeg-shim/
