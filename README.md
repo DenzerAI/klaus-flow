@@ -1,70 +1,98 @@
 # Klaus Flow
 
-Lokale macOS Push-to-Talk-Transkriptions-App. Hält Right-Cmd, spricht, lässt
-Klaus per Groq Whisper transkribieren und pasted das Ergebnis in die fokussierte
-App. Optional: Polish/Translate/Roleplay/Emoji-Postprocessing, WoW-aware
-Chat-Insert, Forward an einen Klaus-Bot, Pane-Hotkeys (Cmd+1..4) für ein
-remote Web-Frontend.
+Lokale macOS Push-to-Talk-Transkriptions-App. Halte **Right ⌘**, sprich, lass los — Klaus
+transkribiert per **Groq Whisper** (turbo) und pasted das Ergebnis in die fokussierte App.
+Optional: Polish/Translate/Roleplay/Emoji-Postprocessing, Pane-Hotkeys (Cmd+1..4) für ein
+eigenes Web-Frontend.
 
-Verteilung: **kein App-Store, keine DMG.** Klaus wird per Claude Code aus
-diesem Repo auf jedem neuen Rechner gebaut und installiert.
+Kein App Store, kein DMG. Wird per Source aus diesem Repo auf jedem Mac gebaut.
 
-## Install auf einem neuen Mac
-
-Voraussetzungen:
-- macOS (arm64 oder x86_64)
-- Xcode Command Line Tools — `xcode-select --install`
-- Ein [Groq API Key](https://console.groq.com/keys) (für Whisper-Transkription)
+## Quick Start
 
 ```bash
-git clone https://github.com/denzerai/klaus-flow.git ~/.klaus-flow
-cd ~/.klaus-flow
-./install.sh
+curl -fsSL https://raw.githubusercontent.com/denzerai/klaus-flow/main/install.sh | bash
 ```
 
-`install.sh` baut die Binary, legt das Bundle in `~/Applications/Klaus.app`
-an und installiert den LaunchAgent. Danach:
+Das war's. Der Installer klont das Repo, baut die Binary, signiert sie ad-hoc, legt das
+App-Bundle in `~/Applications/Klaus.app` an, installiert den LaunchAgent und startet
+Klaus. Danach öffnet sich automatisch das Mikrofon-Berechtigungs-Fenster.
 
-1. **Systemeinstellungen → Datenschutz & Sicherheit**:
-   - Mikrofon → Klaus erlauben
-   - Bedienungshilfen → Klaus erlauben (für globale Hotkeys + Auto-Paste)
-2. Klaus-Menübar-Icon → Preferences → **GROQ_API_KEY** eintragen (`gsk_…`).
-3. **Right Cmd halten und sprechen** → Loslassen pasted die Transkription.
+### Was du danach noch machst (einmalig)
 
-Fallback-Hotkey falls Right Cmd nicht durchkommt: `Ctrl+Shift+Space`.
+1. **Mikrofon erlauben** — Systemeinstellungen → Datenschutz & Sicherheit → Mikrofon → Klaus ✓
+2. **Bedienungshilfen erlauben** (für globale Hotkeys + Auto-Paste) — Systemeinstellungen → Datenschutz & Sicherheit → Bedienungshilfen → Klaus ✓
+3. **Groq API Key eintragen** — Klaus-Menüleisten-Icon → Einstellungen → `gsk_…` einfügen
+   ([Key holen](https://console.groq.com/keys), Free-Tier reicht zum Testen)
+
+Dann **Right ⌘ halten · sprechen · loslassen** → der Text landet in deiner aktuellen App.
+
+## Voraussetzungen
+
+- macOS 13+ (Apple Silicon oder Intel)
+- Xcode Command Line Tools — `xcode-select --install`
+
+## Features
+
+- **Push-to-Talk** mit Right ⌘ (oder beliebige andere Modifier-Taste, einstellbar)
+- **Whisper-Large-v3-Turbo** via Groq (~216× Realtime, multilingual, $0.04/h)
+- **Polish-Mode** — gesprochenes Deutsch grammatikalisch glätten (Llama 3.3 70B)
+- **Translate-Mode** — Deutsch → Englisch
+- **Emoji-Mode** — kuratierte Auswahl, nur gelbe Gesichter + Hände + ❤️🔥💯✅
+- **Wörterbuch** — eigene Fachbegriffe, die als Whisper-Prompt mitgeschickt werden
+  und als Post-Process-Replacement greifen
+- **Auto-Paste** — Cmd+V in fokussiertes Feld, optional auch Enter für direktes Senden
+- **Pane-Hotkeys** (Cmd+1..4) — optional, schickt Transkripte an einen eigenen Server
+  (nur aktiv wenn ein Pane-Token konfiguriert ist; sonst bleiben die Hotkeys frei)
+- **Lokaler Fallback** — wenn Groq nicht erreichbar, wird MLX-Whisper-Turbo lokal verwendet
+  (benötigt `pip install mlx-whisper`)
+- **PTT-Taste umbelegbar** — in den Einstellungen jederzeit auf eine andere Modifier-Taste
+  setzen
+
+## Update
+
+Aus dem Repo:
+
+```bash
+cd ~/.klaus-flow
+git pull
+./build.sh
+```
+
+Oder einfach den One-Liner nochmal laufen lassen — der Installer pulled automatisch.
 
 ## Architektur (Kurz)
 
-- **Source**: `klaus-flow.swift` (~150 KB, Swift + AppKit + Carbon.HIToolbox + AVFoundation)
+- **Source**: `klaus-flow.swift` (~3800 Zeilen Swift, AppKit + AVFoundation + Carbon)
 - **Bundle-ID**: `ai.denzer.klaus`
-- **Audio-Pipeline**: AVAudioRecorder → Groq Whisper → optional Postprocess → Auto-Paste
-- **Persistenz**: `~/.klaus-flow/` (Logs, Dictionary, Sounds, optional pane-token)
+- **Audio-Pipeline**: AVAudioRecorder (16 kHz Mono AAC) → Groq Whisper Turbo → optional Postprocess → Auto-Paste
+- **Persistenz**: `~/.klaus-flow/` (logs, dictionary, sounds, optional pane-token)
 - **LaunchAgent**: `~/Library/LaunchAgents/ai.denzer.klaus.plist` (KeepAlive=true)
 
 ## Dev-Workflow
 
-Auf Christians Mac (oder mit angepassten Pfaden):
-
 ```bash
+cd ~/.klaus-flow
 ./build.sh                # rebuild + redeploy + LaunchAgent reload
 ./build.sh --no-restart   # nur deploy, kein launchctl reload
 ./build.sh --build-only   # nur compile, kein deploy
 ```
 
-`build.sh` hat hartkodierte Pfade auf `~/.klaus-flow` und
-`~/Applications/Klaus.app` — passen, sobald `install.sh` einmal lief.
-
 ## Konfiguration
 
-Setzbar im Klaus-Preferences-Fenster (Menübar-Icon → Settings):
-- **GROQ_API_KEY** — Groq Whisper Auth
-- **Pane-Endpoint + Token** — optional, für Cmd+1..4 Forwarding ans Web-Frontend
-- **Dictionary** — `dictionary.json`, custom transcription replacements
+In den Klaus-Einstellungen (Menüleisten-Icon → Einstellungen):
+
+- **Groq API Key** — Pflicht für Transkription
+- **Polish-Modell** — Groq-Chat-Modell für Polish/Translate/Emoji. Default: `llama-3.3-70b-versatile`
+- **Push-to-Talk-Taste** — beliebige Modifier-Taste (⌘/⌥/⌃/⇧/fn, links oder rechts)
+- **Wörterbuch** — Hörweise → Schreibweise. Default mit ~30 Tech-Terms vorbefüllt
 
 Optionale Env-Vars (im LaunchAgent setzen):
-- `GROQ_API_KEY` — Override für UI-gespeicherten Key
-- `KLAUSFLOW_PANE_TOKEN` — Override für Pane-Auth-Token
+
+- `GROQ_API_KEY` — Override für den UI-gespeicherten Key
+- `KLAUSFLOW_PANE_TOKEN` — Bearer-Token für Pane-Backend (aktiviert Cmd+1..4)
+- `KLAUSFLOW_PANE_ENDPOINT` — URL des Pane-Backends
 
 ## Lizenz
 
-Privat. Kein Public-License — nutzen auf eigene Verantwortung.
+MIT — siehe [LICENSE](LICENSE). Nutzen auf eigene Verantwortung; Klaus drückt globale
+Hotkeys und liest dein Mikrofon, also nur in eigenen Builds laufen lassen.
